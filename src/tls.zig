@@ -235,7 +235,10 @@ pub const TlsInit = struct {
         finished,
     };
 
-    pub const State = enum { CleartextHeader, PreFragment, Fragment, FragmentReadTheirs, HandshakePreLoopStart, HandshakeLoopStart, HandshakeLoopEnd, HandshakeSwitchEnd, HandshakeHelloServerDonePreWrite, HandshakeHelloServerDonePostWrite, Done };
+    const HANDSHAKE_HASH_CAPACITY = 64;
+    const ALL_MSGS_CAPACITY = 126;
+
+    pub const State = enum { CleartextHeader, PreFragment, Fragment, FragmentReadTheirs, HandshakePreLoopStart, HandshakeLoopStart, HandshakeLoopEnd, HandshakeSwitchEnd, HandshakeHelloServerDonePreWrite, HandshakeHelloServerDonePostWrite, HandshakeFinishedPreWrite, HandshakeFinishedPostWrite };
     state: State = .CleartextHeader,
 
     options: Options = undefined,
@@ -277,6 +280,10 @@ pub const TlsInit = struct {
     ctd: tls.Decoder = undefined,
     ct: tls.ContentType = undefined,
     wrapped_handshake: []const u8 = undefined,
+    hsd: tls.Decoder = undefined,
+    handshake_hash: std.BoundedArray(u8, HANDSHAKE_HASH_CAPACITY) = .{},
+    all_msgs_vec: std.BoundedArray(std.posix.iovec_const, 2) = .{},
+    all_msgs: std.BoundedArray(u8, ALL_MSGS_CAPACITY) = .{},
 
     pub fn run(self: *@This(), stream: anytype, E: type, arg: RunArg(E)) InitError(@TypeOf(stream))!Result {
         outer: switch (self.state) {
@@ -369,12 +376,14 @@ pub const TlsInit = struct {
                     .explicit => &self.cleartext_header_buf,
                 };
 
-                var iovecs = [_]std.posix.iovec_const{
+                const iovecs = [_]std.posix.iovec_const{
                     .{ .base = self.cleartext_header.ptr, .len = self.cleartext_header.len },
                     .{ .base = self.host.ptr, .len = self.host.len },
                 };
+                self.all_msgs_vec.resize(0) catch unreachable;
+                self.all_msgs_vec.appendSlice(iovecs[0..if (self.host.len == 0) 1 else 2]) catch unreachable;
                 self.state = .PreFragment;
-                return .{ .action = .{ .writevAll = iovecs[0..if (self.host.len == 0) 1 else 2] } };
+                return .{ .action = .{ .writevAll = self.all_msgs_vec.slice() } };
             },
             .PreFragment => {
                 try arg.stream.writevAll;
@@ -509,7 +518,7 @@ pub const TlsInit = struct {
                 };
                 const handshake_type = self.ctd.decode(tls.HandshakeType);
                 const handshake_len = self.ctd.decode(u24);
-                var hsd = self.ctd.sub(handshake_len) catch {
+                self.hsd = self.ctd.sub(handshake_len) catch {
                     self.state = .Fragment;
                     continue :outer .Fragment;
                 };
@@ -518,24 +527,24 @@ pub const TlsInit = struct {
                     .server_hello => {
                         if (self.cipher_state != .cleartext) return error.TlsUnexpectedMessage;
                         if (self.handshake_state != .hello) return error.TlsUnexpectedMessage;
-                        try hsd.ensure(2 + 32 + 1);
-                        const legacy_version = hsd.decode(u16);
-                        @memcpy(&self.server_hello_rand, hsd.array(32));
+                        try self.hsd.ensure(2 + 32 + 1);
+                        const legacy_version = self.hsd.decode(u16);
+                        @memcpy(&self.server_hello_rand, self.hsd.array(32));
                         if (mem.eql(u8, &self.server_hello_rand, &tls.hello_retry_request_sequence)) {
                             // This is a HelloRetryRequest message. This client implementation
                             // does not expect to get one.
                             return error.TlsUnexpectedMessage;
                         }
-                        const legacy_session_id_echo_len = hsd.decode(u8);
-                        try hsd.ensure(legacy_session_id_echo_len + 2 + 1);
-                        const legacy_session_id_echo = hsd.slice(legacy_session_id_echo_len);
-                        const cipher_suite_tag = hsd.decode(tls.CipherSuite);
-                        hsd.skip(1); // legacy_compression_method
+                        const legacy_session_id_echo_len = self.hsd.decode(u8);
+                        try self.hsd.ensure(legacy_session_id_echo_len + 2 + 1);
+                        const legacy_session_id_echo = self.hsd.slice(legacy_session_id_echo_len);
+                        const cipher_suite_tag = self.hsd.decode(tls.CipherSuite);
+                        self.hsd.skip(1); // legacy_compression_method
                         var supported_version: ?u16 = null;
-                        if (!hsd.eof()) {
-                            try hsd.ensure(2);
-                            const extensions_size = hsd.decode(u16);
-                            var all_extd = try hsd.sub(extensions_size);
+                        if (!self.hsd.eof()) {
+                            try self.hsd.ensure(2);
+                            const extensions_size = self.hsd.decode(u16);
+                            var all_extd = try self.hsd.sub(extensions_size);
                             while (!all_extd.eof()) {
                                 try all_extd.ensure(2 + 2);
                                 const et = all_extd.decode(tls.ExtensionType);
@@ -650,9 +659,9 @@ pub const TlsInit = struct {
                         switch (self.handshake_cipher) {
                             inline else => |*p| p.transcript_hash.update(self.wrapped_handshake),
                         }
-                        try hsd.ensure(2);
-                        const total_ext_size = hsd.decode(u16);
-                        var all_extd = try hsd.sub(total_ext_size);
+                        try self.hsd.ensure(2);
+                        const total_ext_size = self.hsd.decode(u16);
+                        var all_extd = try self.hsd.sub(total_ext_size);
                         while (!all_extd.eof()) {
                             try all_extd.ensure(4);
                             const et = all_extd.decode(tls.ExtensionType);
@@ -679,15 +688,15 @@ pub const TlsInit = struct {
 
                         switch (self.tls_version) {
                             .tls_1_3 => {
-                                try hsd.ensure(1 + 3);
-                                const cert_req_ctx_len = hsd.decode(u8);
+                                try self.hsd.ensure(1 + 3);
+                                const cert_req_ctx_len = self.hsd.decode(u8);
                                 if (cert_req_ctx_len != 0) return error.TlsIllegalParameter;
                             },
-                            .tls_1_2 => try hsd.ensure(3),
+                            .tls_1_2 => try self.hsd.ensure(3),
                             else => unreachable,
                         }
-                        const certs_size = hsd.decode(u24);
-                        var certs_decoder = try hsd.sub(certs_size);
+                        const certs_size = self.hsd.decode(u24);
+                        var certs_decoder = try self.hsd.sub(certs_size);
                         while (!certs_decoder.eof()) {
                             try certs_decoder.ensure(3);
                             const cert_size = certs_decoder.decode(u24);
@@ -755,14 +764,14 @@ pub const TlsInit = struct {
                         switch (self.handshake_cipher) {
                             inline else => |*p| p.transcript_hash.update(self.wrapped_handshake),
                         }
-                        try hsd.ensure(1 + 2 + 1);
-                        const curve_type = hsd.decode(u8);
+                        try self.hsd.ensure(1 + 2 + 1);
+                        const curve_type = self.hsd.decode(u8);
                         if (curve_type != 0x03) return error.TlsIllegalParameter; // named_curve
-                        const named_group = hsd.decode(tls.NamedGroup);
-                        const key_size = hsd.decode(u8);
-                        try hsd.ensure(key_size);
-                        const server_pub_key = hsd.slice(key_size);
-                        try self.main_cert_pub_key.verifySignature(&hsd, &.{ &self.client_hello_rand, &self.server_hello_rand, hsd.buf[0..hsd.idx] });
+                        const named_group = self.hsd.decode(tls.NamedGroup);
+                        const key_size = self.hsd.decode(u8);
+                        try self.hsd.ensure(key_size);
+                        const server_pub_key = self.hsd.slice(key_size);
+                        try self.main_cert_pub_key.verifySignature(&self.hsd, &.{ &self.client_hello_rand, &self.server_hello_rand, self.hsd.buf[0..self.hsd.idx] });
                         try self.key_share.exchange(named_group, server_pub_key);
                         self.handshake_state = .server_hello_done;
                     },
@@ -780,7 +789,7 @@ pub const TlsInit = struct {
                         }
                         switch (self.handshake_cipher) {
                             inline else => |*p| {
-                                try self.main_cert_pub_key.verifySignature(&hsd, &.{
+                                try self.main_cert_pub_key.verifySignature(&self.hsd, &.{
                                     " " ** 64 ++ "TLS 1.3, server CertificateVerify\x00",
                                     &p.transcript_hash.peek(),
                                 });
@@ -790,104 +799,8 @@ pub const TlsInit = struct {
                         self.handshake_state = .finished;
                     },
                     .finished => {
-                        if (self.cipher_state == .cleartext) return error.TlsUnexpectedMessage;
-                        if (self.handshake_state != .finished) return error.TlsUnexpectedMessage;
-                        // This message is to trick buggy proxies into behaving correctly.
-                        const client_change_cipher_spec_msg = .{@intFromEnum(tls.ContentType.change_cipher_spec)} ++
-                            int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
-                            array(u16, tls.ChangeCipherSpecType, .{.change_cipher_spec});
-                        const app_cipher = app_cipher: switch (self.handshake_cipher) {
-                            inline else => |*p, tag| switch (self.tls_version) {
-                                .tls_1_3 => {
-                                    const pv = &p.version.tls_1_3;
-                                    const P = @TypeOf(p.*).A;
-                                    try hsd.ensure(P.Hmac.mac_length);
-                                    const finished_digest = p.transcript_hash.peek();
-                                    p.transcript_hash.update(self.wrapped_handshake);
-                                    const expected_server_verify_data = tls.hmac(P.Hmac, &finished_digest, pv.server_finished_key);
-                                    if (!std.crypto.timing_safe.eql([P.Hmac.mac_length]u8, expected_server_verify_data, hsd.array(P.Hmac.mac_length).*)) return error.TlsDecryptError;
-                                    const handshake_hash = p.transcript_hash.finalResult();
-                                    const verify_data = tls.hmac(P.Hmac, &handshake_hash, pv.client_finished_key);
-                                    const out_cleartext = .{@intFromEnum(tls.HandshakeType.finished)} ++
-                                        array(u24, u8, verify_data) ++
-                                        .{@intFromEnum(tls.ContentType.handshake)};
-
-                                    const wrapped_len = out_cleartext.len + P.AEAD.tag_length;
-
-                                    var finished_msg = .{@intFromEnum(tls.ContentType.application_data)} ++
-                                        int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
-                                        array(u16, u8, @as([wrapped_len]u8, undefined));
-
-                                    const ad = finished_msg[0..tls.record_header_len];
-                                    const ciphertext = finished_msg[tls.record_header_len..][0..out_cleartext.len];
-                                    const auth_tag = finished_msg[finished_msg.len - P.AEAD.tag_length ..];
-                                    const nonce = pv.client_handshake_iv;
-                                    P.AEAD.encrypt(ciphertext, auth_tag, &out_cleartext, ad, nonce, pv.client_handshake_key);
-
-                                    const all_msgs = client_change_cipher_spec_msg ++ finished_msg;
-                                    var all_msgs_vec = [_]std.posix.iovec_const{
-                                        .{ .base = &all_msgs, .len = all_msgs.len },
-                                    };
-                                    try stream.writevAll(&all_msgs_vec);
-
-                                    const client_secret = hkdfExpandLabel(P.Hkdf, pv.master_secret, "c ap traffic", &handshake_hash, P.Hash.digest_length);
-                                    const server_secret = hkdfExpandLabel(P.Hkdf, pv.master_secret, "s ap traffic", &handshake_hash, P.Hash.digest_length);
-                                    if (self.options.ssl_key_log_file) |key_log_file| logSecrets(key_log_file, .{
-                                        .counter = self.key_seq,
-                                        .client_random = &self.client_hello_rand,
-                                    }, .{
-                                        .SERVER_TRAFFIC_SECRET = &server_secret,
-                                        .CLIENT_TRAFFIC_SECRET = &client_secret,
-                                    });
-                                    self.key_seq += 1;
-                                    break :app_cipher @unionInit(tls.ApplicationCipher, @tagName(tag), .{ .tls_1_3 = .{
-                                        .client_secret = client_secret,
-                                        .server_secret = server_secret,
-                                        .client_key = hkdfExpandLabel(P.Hkdf, client_secret, "key", "", P.AEAD.key_length),
-                                        .server_key = hkdfExpandLabel(P.Hkdf, server_secret, "key", "", P.AEAD.key_length),
-                                        .client_iv = hkdfExpandLabel(P.Hkdf, client_secret, "iv", "", P.AEAD.nonce_length),
-                                        .server_iv = hkdfExpandLabel(P.Hkdf, server_secret, "iv", "", P.AEAD.nonce_length),
-                                    } });
-                                },
-                                .tls_1_2 => {
-                                    const pv = &p.version.tls_1_2;
-                                    const P = @TypeOf(p.*).A;
-                                    try hsd.ensure(P.verify_data_length);
-                                    if (!std.crypto.timing_safe.eql([P.verify_data_length]u8, pv.expected_server_verify_data, hsd.array(P.verify_data_length).*)) return error.TlsDecryptError;
-                                    break :app_cipher @unionInit(tls.ApplicationCipher, @tagName(tag), .{ .tls_1_2 = pv.app_cipher });
-                                },
-                                else => unreachable,
-                            },
-                        };
-                        const leftover = self.d.rest();
-                        var client: Client = .{
-                            .tls_version = self.tls_version,
-                            .read_seq = switch (self.tls_version) {
-                                .tls_1_3 => 0,
-                                .tls_1_2 => self.read_seq,
-                                else => unreachable,
-                            },
-                            .write_seq = switch (self.tls_version) {
-                                .tls_1_3 => 0,
-                                .tls_1_2 => self.write_seq,
-                                else => unreachable,
-                            },
-                            .partial_cleartext_idx = 0,
-                            .partial_ciphertext_idx = 0,
-                            .partial_ciphertext_end = @intCast(leftover.len),
-                            .received_close_notify = false,
-                            .allow_truncation_attacks = false,
-                            .application_cipher = app_cipher,
-                            .partially_read_buffer = undefined,
-                            .ssl_key_log = if (self.options.ssl_key_log_file) |key_log_file| .{
-                                .client_key_seq = self.key_seq,
-                                .server_key_seq = self.key_seq,
-                                .client_random = self.client_hello_rand,
-                                .file = key_log_file,
-                            } else null,
-                        };
-                        @memcpy(client.partially_read_buffer[0..leftover.len], leftover);
-                        return .{ .done = client };
+                        self.state = .HandshakeFinishedPreWrite;
+                        continue :outer .HandshakeFinishedPreWrite;
                     },
                     else => return error.TlsUnexpectedMessage,
                 }
@@ -966,11 +879,20 @@ pub const TlsInit = struct {
                             pv.app_cipher.client_write_key,
                         );
                         const all_msgs = client_key_exchange_msg ++ client_change_cipher_spec_msg ++ client_verify_msg;
-                        var all_msgs_vec = [_]std.posix.iovec_const{
-                            .{ .base = &all_msgs, .len = all_msgs.len },
+                        {
+                            const REQUIRED = @typeInfo(@TypeOf(all_msgs)).array.len;
+                            if (ALL_MSGS_CAPACITY < REQUIRED)
+                                @compileError(std.fmt.comptimePrint("Require {} all msgs capacity, found {}", .{ REQUIRED, ALL_MSGS_CAPACITY }));
+                        }
+                        self.all_msgs.resize(0) catch unreachable;
+                        self.all_msgs.appendSlice(&all_msgs) catch unreachable;
+                        const all_msgs_vec = [_]std.posix.iovec_const{
+                            .{ .base = self.all_msgs.slice().ptr, .len = self.all_msgs.slice().len },
                         };
+                        self.all_msgs_vec.resize(0) catch unreachable;
+                        self.all_msgs_vec.appendSlice(&all_msgs_vec) catch unreachable;
                         self.state = .HandshakeHelloServerDonePostWrite;
-                        return .{ .action = .{ .writevAll = &all_msgs_vec } };
+                        return .{ .action = .{ .writevAll = self.all_msgs_vec.slice() } };
                     },
                 }
             },
@@ -981,6 +903,142 @@ pub const TlsInit = struct {
                 self.handshake_state = .finished;
                 self.state = .HandshakeSwitchEnd;
                 continue :outer .HandshakeSwitchEnd;
+            },
+            .HandshakeFinishedPreWrite => {
+                if (self.cipher_state == .cleartext) return error.TlsUnexpectedMessage;
+                if (self.handshake_state != .finished) return error.TlsUnexpectedMessage;
+                // This message is to trick buggy proxies into behaving correctly.
+                const client_change_cipher_spec_msg = .{@intFromEnum(tls.ContentType.change_cipher_spec)} ++
+                    int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
+                    array(u16, tls.ChangeCipherSpecType, .{.change_cipher_spec});
+                switch (self.handshake_cipher) {
+                    inline else => |*p| switch (self.tls_version) {
+                        .tls_1_3 => {
+                            const pv = &p.version.tls_1_3;
+                            const P = @TypeOf(p.*).A;
+                            try self.hsd.ensure(P.Hmac.mac_length);
+                            const finished_digest = p.transcript_hash.peek();
+                            p.transcript_hash.update(self.wrapped_handshake);
+                            const expected_server_verify_data = tls.hmac(P.Hmac, &finished_digest, pv.server_finished_key);
+                            if (!std.crypto.timing_safe.eql([P.Hmac.mac_length]u8, expected_server_verify_data, self.hsd.array(P.Hmac.mac_length).*)) return error.TlsDecryptError;
+                            const handshake_hash = p.transcript_hash.finalResult();
+                            {
+                                const REQUIRED = @typeInfo(@typeInfo(@TypeOf(@TypeOf(p.transcript_hash).finalResult)).@"fn".return_type.?).array.len;
+                                if (comptime HANDSHAKE_HASH_CAPACITY < REQUIRED)
+                                    @compileError(std.fmt.comptimePrint("Require {} handshake hash capacity, found {}", .{ REQUIRED, HANDSHAKE_HASH_CAPACITY }));
+                            }
+                            self.handshake_hash.resize(0) catch unreachable;
+                            self.handshake_hash.appendSlice(&handshake_hash) catch unreachable;
+                            const verify_data = tls.hmac(P.Hmac, self.handshake_hash.slice(), pv.client_finished_key);
+                            const out_cleartext = .{@intFromEnum(tls.HandshakeType.finished)} ++
+                                array(u24, u8, verify_data) ++
+                                .{@intFromEnum(tls.ContentType.handshake)};
+
+                            const wrapped_len = out_cleartext.len + P.AEAD.tag_length;
+
+                            var finished_msg = .{@intFromEnum(tls.ContentType.application_data)} ++
+                                int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
+                                array(u16, u8, @as([wrapped_len]u8, undefined));
+
+                            const ad = finished_msg[0..tls.record_header_len];
+                            const ciphertext = finished_msg[tls.record_header_len..][0..out_cleartext.len];
+                            const auth_tag = finished_msg[finished_msg.len - P.AEAD.tag_length ..];
+                            const nonce = pv.client_handshake_iv;
+                            P.AEAD.encrypt(ciphertext, auth_tag, &out_cleartext, ad, nonce, pv.client_handshake_key);
+
+                            const all_msgs = client_change_cipher_spec_msg ++ finished_msg;
+                            {
+                                const REQUIRED = @typeInfo(@TypeOf(all_msgs)).array.len;
+                                if (ALL_MSGS_CAPACITY < REQUIRED)
+                                    @compileError(std.fmt.comptimePrint("Require {} all msgs capacity, found {}", .{ REQUIRED, ALL_MSGS_CAPACITY }));
+                            }
+                            self.all_msgs.resize(0) catch unreachable;
+                            self.all_msgs.appendSlice(&all_msgs) catch unreachable;
+                            const all_msgs_vec = [_]std.posix.iovec_const{
+                                .{ .base = self.all_msgs.slice().ptr, .len = self.all_msgs.slice().len },
+                            };
+                            self.all_msgs_vec.resize(0) catch unreachable;
+                            self.all_msgs_vec.appendSlice(&all_msgs_vec) catch unreachable;
+
+                            self.state = .HandshakeFinishedPostWrite;
+                            return .{ .action = .{ .writevAll = self.all_msgs_vec.slice() } };
+                        },
+                        .tls_1_2 => {
+                            self.state = .HandshakeFinishedPostWrite;
+                            continue :outer .HandshakeFinishedPostWrite;
+                        },
+                        else => unreachable,
+                    },
+                }
+            },
+            .HandshakeFinishedPostWrite => {
+                const app_cipher = app_cipher: switch (self.handshake_cipher) {
+                    inline else => |*p, tag| switch (self.tls_version) {
+                        .tls_1_3 => {
+                            try arg.stream.writevAll;
+
+                            const pv = &p.version.tls_1_3;
+                            const P = @TypeOf(p.*).A;
+
+                            const client_secret = hkdfExpandLabel(P.Hkdf, pv.master_secret, "c ap traffic", self.handshake_hash.slice(), P.Hash.digest_length);
+                            const server_secret = hkdfExpandLabel(P.Hkdf, pv.master_secret, "s ap traffic", self.handshake_hash.slice(), P.Hash.digest_length);
+                            if (self.options.ssl_key_log_file) |key_log_file| logSecrets(key_log_file, .{
+                                .counter = self.key_seq,
+                                .client_random = &self.client_hello_rand,
+                            }, .{
+                                .SERVER_TRAFFIC_SECRET = &server_secret,
+                                .CLIENT_TRAFFIC_SECRET = &client_secret,
+                            });
+                            self.key_seq += 1;
+
+                            break :app_cipher @unionInit(tls.ApplicationCipher, @tagName(tag), .{ .tls_1_3 = .{
+                                .client_secret = client_secret,
+                                .server_secret = server_secret,
+                                .client_key = hkdfExpandLabel(P.Hkdf, client_secret, "key", "", P.AEAD.key_length),
+                                .server_key = hkdfExpandLabel(P.Hkdf, server_secret, "key", "", P.AEAD.key_length),
+                                .client_iv = hkdfExpandLabel(P.Hkdf, client_secret, "iv", "", P.AEAD.nonce_length),
+                                .server_iv = hkdfExpandLabel(P.Hkdf, server_secret, "iv", "", P.AEAD.nonce_length),
+                            } });
+                        },
+                        .tls_1_2 => {
+                            const pv = &p.version.tls_1_2;
+                            const P = @TypeOf(p.*).A;
+                            try self.hsd.ensure(P.verify_data_length);
+                            if (!std.crypto.timing_safe.eql([P.verify_data_length]u8, pv.expected_server_verify_data, self.hsd.array(P.verify_data_length).*)) return error.TlsDecryptError;
+                            break :app_cipher @unionInit(tls.ApplicationCipher, @tagName(tag), .{ .tls_1_2 = pv.app_cipher });
+                        },
+                        else => unreachable,
+                    },
+                };
+                const leftover = self.d.rest();
+                var client: Client = .{
+                    .tls_version = self.tls_version,
+                    .read_seq = switch (self.tls_version) {
+                        .tls_1_3 => 0,
+                        .tls_1_2 => self.read_seq,
+                        else => unreachable,
+                    },
+                    .write_seq = switch (self.tls_version) {
+                        .tls_1_3 => 0,
+                        .tls_1_2 => self.write_seq,
+                        else => unreachable,
+                    },
+                    .partial_cleartext_idx = 0,
+                    .partial_ciphertext_idx = 0,
+                    .partial_ciphertext_end = @intCast(leftover.len),
+                    .received_close_notify = false,
+                    .allow_truncation_attacks = false,
+                    .application_cipher = app_cipher,
+                    .partially_read_buffer = undefined,
+                    .ssl_key_log = if (self.options.ssl_key_log_file) |key_log_file| .{
+                        .client_key_seq = self.key_seq,
+                        .server_key_seq = self.key_seq,
+                        .client_random = self.client_hello_rand,
+                        .file = key_log_file,
+                    } else null,
+                };
+                @memcpy(client.partially_read_buffer[0..leftover.len], leftover);
+                return .{ .done = client };
             },
             .HandshakeSwitchEnd => {
                 if (self.ctd.eof()) {
@@ -997,7 +1055,6 @@ pub const TlsInit = struct {
                 self.state = .Fragment;
                 continue :outer .Fragment;
             },
-            .Done => return undefined,
         }
     }
 };
