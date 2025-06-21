@@ -5,6 +5,8 @@ const PendingIndex = @import("loop.zig").PendingIndex;
 const default_initialize = @import("mem.zig").default_initialize;
 const Ring = @import("io_uring.zig").Ring;
 
+const vendored_tls = @import("tls.zig");
+
 //
 // Event Combinators
 //
@@ -166,6 +168,8 @@ pub const ExampleSSLRequest = struct {
 
     client: i32,
     address: *std.net.Address,
+    bundle: *std.crypto.Certificate.Bundle,
+    tls_client: std.crypto.tls.Client = undefined,
 
     state: State = .Connect,
     result: Result = undefined,
@@ -193,6 +197,12 @@ pub const ExampleSSLRequest = struct {
                     },
                     else => |err| std.debug.print("Connect Err: {}\n", .{err}),
                 }
+
+                const stream = std.net.Stream{ .handle = self.client };
+                self.tls_client = try vendored_tls.init(stream, .{
+                    .host = .{ .explicit = "example.com" },
+                    .ca = .{ .bundle = self.bundle.* },
+                });
                 const buffer_send = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
                 self.state = .Read;
                 try loop.schedule_with_callback(SocketWrite{
@@ -568,14 +578,18 @@ pub fn main() !void {
         recv: [1024 * 64]u8,
     };
 
-    var loop = try Loop(&[_]type{ Timeout, WriteStdout, CQEResultPendingEvent, PollCompletions, Connect, SocketWrite, SocketRead, ExampleRequest }, Context).init(std.heap.smp_allocator, .{
+    var loop = try Loop(&[_]type{ Timeout, WriteStdout, CQEResultPendingEvent, PollCompletions, Connect, SocketWrite, SocketRead, ExampleRequest, ExampleSSLRequest }, Context).init(std.heap.smp_allocator, .{
         .ring = &ring.ring,
         .recv = undefined,
     });
     defer loop.deinit();
 
+    var bundle: std.crypto.Certificate.Bundle = .{};
+    try bundle.rescan(allocator);
+    defer bundle.deinit(allocator);
+
     try loop.schedule(Timeout.init(std.time.ns_per_s));
-    try loop.schedule(ExampleSSLRequest{ .client = @intCast(client), .address = &address });
+    try loop.schedule(ExampleSSLRequest{ .client = @intCast(client), .address = &address, .bundle = &bundle });
     try loop.schedule(PollCompletions{});
     try loop.run();
 }
