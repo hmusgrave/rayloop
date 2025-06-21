@@ -132,8 +132,8 @@ pub const Options = struct {
     ssl_key_log_file: ?std.fs.File = null,
 };
 
-pub fn InitError(comptime Stream: type) type {
-    return std.mem.Allocator.Error || Stream.WriteError || Stream.ReadError || tls.AlertDescription.Error || error{
+pub fn InitError(E: type) type {
+    return std.mem.Allocator.Error || E || tls.AlertDescription.Error || error{
         InsufficientEntropy,
         DiskQuota,
         LockViolation,
@@ -285,7 +285,7 @@ pub const TlsInit = struct {
     all_msgs_vec: std.BoundedArray(std.posix.iovec_const, 2) = .{},
     all_msgs: std.BoundedArray(u8, ALL_MSGS_CAPACITY) = .{},
 
-    pub fn run(self: *@This(), stream: anytype, E: type, arg: RunArg(E)) InitError(@TypeOf(stream))!Result {
+    pub fn run(self: *@This(), E: type, arg: RunArg(E)) InitError(E)!Result {
         outer: switch (self.state) {
             .CleartextHeader => {
                 self.options = arg.options;
