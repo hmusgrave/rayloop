@@ -148,6 +148,17 @@ pub const SocketWrite = IoUringSQE(SocketWritePayload, struct {
     }
 }._f);
 
+pub const WritevPayload = struct {
+    client: i32,
+    iovecs: []const std.posix.iovec_const,
+};
+
+pub const Writev = IoUringSQE(WritevPayload, struct {
+    pub fn _f(ring: *std.os.linux.IoUring, loc: u64, payload: WritevPayload) !void {
+        _ = try ring.writev(loc, payload.client, payload.iovecs, 0);
+    }
+}._f);
+
 pub const SocketReadPayload = struct {
     client: i32,
     buffer: []u8,
@@ -158,6 +169,76 @@ pub const SocketRead = IoUringSQE(SocketReadPayload, struct {
         _ = try ring.recv(loc, payload.client, .{ .buffer = payload.buffer }, 0);
     }
 }._f);
+
+//
+// IoUring Composite Events
+//
+pub const WritevAllPayload = struct {
+    client: i32,
+    iovecs: []const std.posix.iovec_const,
+};
+
+pub const WritevAll = struct {
+    pub const State = enum { Init, SQE, CQE, Done };
+    pub const Result = std.os.linux.E;
+
+    client: i32,
+    iovecs: []std.posix.iovec_const,
+    i: usize = 0,
+
+    state: State = .Init,
+    result: Result = .SUCCESS,
+    scheduled: bool = false,
+    returned_from: PendingIndex = PendingIndex.empty(),
+    callback: PendingIndex = PendingIndex.empty(),
+
+    pub fn run(self: *@This(), loop: anytype) !void {
+        outer: switch (self.state) {
+            .Init => {
+                if (self.iovecs.len == 0) {
+                    self.state = .Done;
+                    return;
+                }
+                self.state = .SQE;
+                continue :outer .SQE;
+            },
+            .SQE => {
+                self.state = .CQE;
+                try loop.schedule_with_callback(Writev{
+                    .payload = .{
+                        .client = self.client,
+                        .iovecs = self.iovecs[self.i..],
+                    },
+                }, self);
+            },
+            .CQE => {
+                const res = loop.result_for(Writev, self.returned_from);
+                switch (res.err()) {
+                    .SUCCESS => {},
+                    else => |err| {
+                        self.result = err;
+                        self.state = .Done;
+                        return;
+                    },
+                }
+                var amt: usize = @intCast(res.result);
+                while (amt >= self.iovecs[self.i].len) {
+                    amt -= self.iovecs[self.i].len;
+                    self.i += 1;
+                    if (self.i >= self.iovecs.len) {
+                        self.state = .Done;
+                        return;
+                    }
+                }
+                self.iovecs[self.i].base += amt;
+                self.iovecs[self.i].len -= amt;
+                self.state = .SQE;
+                continue :outer .SQE;
+            },
+            .Done => {},
+        }
+    }
+};
 
 //
 // Example SSL Request Workload
@@ -183,49 +264,89 @@ pub const WriteStream = struct {
 };
 
 pub const TlsInit = struct {
-    pub const State = enum { Done };
+    pub const State = enum { Init, Recv, Send, Done };
     pub const Result = vendored_tls.InitError(E)!std.crypto.tls.Client;
 
-    const E = std.net.Stream.WriteError || error{ IsDir, ConnectionTimedOut, NotOpenForReading, SocketNotConnected, Canceled, TlsRecordOverflow, TlsConnectionTruncated };
+    // TODO: clean up when all "stream" bullshit is removed, handle errno
+    const E = std.net.Stream.WriteError || error{ IsDir, ConnectionTimedOut, NotOpenForReading, SocketNotConnected, Canceled, TlsRecordOverflow, TlsConnectionTruncated } || error{Linux};
 
     client: i32,
     host: []const u8,
     tls_init: *vendored_tls.TlsInit,
     options: vendored_tls.Options,
+    child_state: vendored_tls.TlsInit.RunArg(E) = undefined,
+    last_action: vendored_tls.TlsInit.Result = undefined,
 
-    state: State = .Done,
+    state: State = .Init,
     result: Result = undefined,
     scheduled: bool = false,
     returned_from: PendingIndex = PendingIndex.empty(),
     callback: PendingIndex = PendingIndex.empty(),
 
     pub fn run(self: *@This(), loop: anytype) !void {
-        _ = loop;
-        self.tls_init.* = vendored_tls.TlsInit{};
-        var state: vendored_tls.TlsInit.RunArg(E) = .{ .options = self.options };
-        while (true) {
-            switch (try self.tls_init.run(E, state)) {
-                .done => |client| {
-                    self.result = client;
-                    break;
-                },
-                .action => |act| switch (act) {
-                    .writevAll => |iovecs| {
-                        const net_stream = std.net.Stream{ .handle = self.client };
-                        state = .{ .stream = .{ .writevAll = net_stream.writevAll(iovecs) } };
-                    },
-                    .decoder => |dec| switch (dec) {
-                        .readAtLeast => |x| {
-                            const net_stream = std.net.Stream{ .handle = self.client };
-                            state = .{ .stream = .{ .decoder = .{ .readAtLeast = x.decoder.readAtLeast(net_stream, x.their_amt) } } };
+        outer: switch (self.state) {
+            .Init => {
+                self.tls_init.* = vendored_tls.TlsInit{};
+                self.child_state = .{ .options = self.options };
+                self.state = .Send;
+                continue :outer .Send;
+            },
+            .Recv => {
+                switch (self.last_action) {
+                    .done => unreachable,
+                    .action => |act| switch (act) {
+                        .writevAll => {
+                            const res = loop.result_for(WritevAll, self.returned_from);
+                            switch (res) {
+                                .SUCCESS => {},
+                                else => {
+                                    self.result = error.Linux;
+                                    self.state = .Done;
+                                    return;
+                                },
+                            }
+                            self.child_state = .{ .stream = .{ .writevAll = {} } };
+                            self.state = .Send;
+                            continue :outer .Send;
                         },
-                        .readAtLeastOurAmt => |x| {
-                            const net_stream = std.net.Stream{ .handle = self.client };
-                            state = .{ .stream = .{ .decoder = .{ .readAtLeastOurAmt = x.decoder.readAtLeastOurAmt(net_stream, x.our_amt) } } };
+                        // TODO
+                        .decoder => unreachable,
+                    },
+                }
+            },
+            .Send => {
+                self.last_action = try self.tls_init.run(E, self.child_state);
+                switch (self.last_action) {
+                    .done => |client| {
+                        self.result = client;
+                        self.state = .Done;
+                        return;
+                    },
+                    .action => |act| switch (act) {
+                        .writevAll => |iovecs| {
+                            self.state = .Recv;
+                            try loop.schedule_with_callback(WritevAll{
+                                .client = self.client,
+                                .iovecs = iovecs,
+                            }, self);
+                            return;
+                        },
+                        .decoder => |dec| switch (dec) {
+                            .readAtLeast => |x| {
+                                const net_stream = std.net.Stream{ .handle = self.client };
+                                self.child_state = .{ .stream = .{ .decoder = .{ .readAtLeast = x.decoder.readAtLeast(net_stream, x.their_amt) } } };
+                            },
+                            .readAtLeastOurAmt => |x| {
+                                const net_stream = std.net.Stream{ .handle = self.client };
+                                self.child_state = .{ .stream = .{ .decoder = .{ .readAtLeastOurAmt = x.decoder.readAtLeastOurAmt(net_stream, x.our_amt) } } };
+                            },
                         },
                     },
-                },
-            }
+                }
+                self.state = .Send;
+                continue :outer .Send;
+            },
+            .Done => {},
         }
     }
 };
@@ -483,8 +604,8 @@ pub fn Loop(events: []const type, Context: type) type {
                             var callback_event = callback_pool.get(event.callback.pool_index);
                             callback_pool.release(event.callback.pool_index);
                             callback_event.returned_from = loc;
-                            self.outstanding_work -= 1;
                             try self.schedule(callback_event);
+                            self.outstanding_work -= 1;
                         }
                     }
                 }
@@ -595,6 +716,7 @@ pub fn Loop(events: []const type, Context: type) type {
                                     if (j == callback.tuple_index) {
                                         var callback_pool = self.pending.getByIndex(j);
                                         var callback_event = callback_pool.get(callback.pool_index);
+
                                         callback_pool.release(callback.pool_index);
 
                                         var event_pool = self.pending.getByIndex(i);
@@ -643,7 +765,7 @@ pub fn main() !void {
         tls_init: vendored_tls.TlsInit,
     };
 
-    var loop = try Loop(&[_]type{ Timeout, WriteStdout, CQEResultPendingEvent, PollCompletions, Connect, SocketWrite, SocketRead, ExampleRequest, ExampleSSLRequest, TlsInit }, Context).init(std.heap.smp_allocator, .{
+    var loop = try Loop(&[_]type{ Timeout, WriteStdout, CQEResultPendingEvent, PollCompletions, Connect, SocketWrite, SocketRead, ExampleRequest, ExampleSSLRequest, TlsInit, WritevAll, Writev }, Context).init(std.heap.smp_allocator, .{
         .ring = &ring.ring,
         .recv = undefined,
         .tls_client = undefined,
