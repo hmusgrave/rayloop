@@ -8,16 +8,47 @@ const Ring = @import("io_uring.zig").Ring;
 const vendored_tls = @import("tls.zig");
 
 //
+// Errno BS
+//
+const ErrnoErrorset = blk: {
+    const ti = @typeInfo(std.os.linux.E).@"enum";
+    var errs: [ti.fields.len]std.builtin.Type.Error = undefined;
+    for (0..errs.len) |i|
+        errs[i] = .{ .name = ti.fields[i].name };
+    break :blk @Type(.{ .error_set = &errs });
+};
+
+const errno_lookup = blk: {
+    @setEvalBranchQuota(100_000);
+    const ti = @typeInfo(std.os.linux.E).@"enum";
+    var lookup: [std.math.maxInt(ti.tag_type) + 1]ErrnoErrorset = undefined;
+    for (&lookup) |*x|
+        x.* = error.SUCCESS;
+    for (ti.fields) |field|
+        lookup[field.value] = @field(ErrnoErrorset, field.name);
+    break :blk lookup;
+};
+
+fn to_error_union(e: std.os.linux.E) ErrnoErrorset!void {
+    return switch (e) {
+        .SUCCESS => {},
+        else => |tag| errno_lookup[@intCast(@intFromEnum(tag))],
+    };
+}
+
+//
 // Event Combinators
 //
+pub const SQEError = ErrnoErrorset || error{SubmissionQueueFull};
+
 pub fn IoUringSQE(Payload: type, submit: anytype) type {
     return struct {
-        pub const State = enum { Submitting, Done };
-        pub const Result = CQEResult;
+        pub const State = enum { SQE, CQE, Done };
+        pub const Result = SQEError!CQEResult;
 
         payload: Payload,
 
-        state: State = .Submitting,
+        state: State = .SQE,
         result: Result = undefined,
         scheduled: bool = false,
         returned_from: PendingIndex = PendingIndex.empty(),
@@ -25,16 +56,23 @@ pub fn IoUringSQE(Payload: type, submit: anytype) type {
 
         pub fn run(self: *@This(), loop: anytype) !void {
             switch (self.state) {
-                .Submitting => {
+                .SQE => {
                     const pwc = try loop.pend_with_callback(CQEResultPendingEvent{}, self);
                     const ring: *std.os.linux.IoUring = loop.context.ring;
-                    self.state = .Done;
-                    try submit(ring, pwc.pend_loc.to_u64(), self.payload);
-                    try pwc.store.store(self.*);
+                    self.state = .CQE;
+                    submit(ring, pwc.pend_loc.to_u64(), self.payload) catch |err| {
+                        self.result = err;
+                        self.scheduled = false;
+                        self.state = .Done;
+                        return;
+                    };
+                    pwc.store.store(self.*);
                 },
-                .Done => {
+                .CQE => {
+                    self.state = .Done;
                     self.result = loop.result_for(CQEResultPendingEvent, self.returned_from);
                 },
+                .Done => {},
             }
         }
     };
@@ -43,7 +81,7 @@ pub fn IoUringSQE(Payload: type, submit: anytype) type {
 //
 // Recurring, bookkeeping events
 //
-const Timeout = struct {
+const LoopTimeout = struct {
     pub const State = enum { Waiting, Done };
     pub const Result = void;
 
@@ -71,15 +109,20 @@ pub const CQEResult = struct {
     result: i32,
     flags: u32,
 
-    pub fn err(self: @This()) std.os.linux.E {
+    pub fn errno(self: @This()) std.os.linux.E {
         const cqe = std.os.linux.io_uring_cqe{ .user_data = undefined, .res = self.result, .flags = self.flags };
         return cqe.err();
+    }
+
+    pub fn err(self: @This()) ErrnoErrorset!@This() {
+        try to_error_union(self.errno());
+        return self;
     }
 };
 
 pub const CQEResultPendingEvent = struct {
     pub const State = enum { Done };
-    pub const Result = CQEResult;
+    pub const Result = ErrnoErrorset!CQEResult;
 
     state: State = .Done,
     result: Result = undefined,
@@ -110,7 +153,8 @@ pub const PollCompletions = struct {
             defer completed += cqes.len;
 
             for (cqes) |*cqe| {
-                try loop.unpend_follow_callback(PendingIndex.from_u64(cqe.user_data), CQEResult, .{ .result = cqe.res, .flags = cqe.flags });
+                const cqe_result = CQEResult{ .result = cqe.res, .flags = cqe.flags };
+                try loop.unpend_follow_callback(PendingIndex.from_u64(cqe.user_data), ErrnoErrorset!CQEResult, cqe_result.err());
             }
         }
         _ = try loop.context.ring.submit();
@@ -137,13 +181,13 @@ pub const Connect = IoUringSQE(ConnectPayload, struct {
     }
 }._f);
 
-pub const SocketWritePayload = struct {
+pub const WritePayload = struct {
     client: i32,
     data: []const u8,
 };
 
-pub const SocketWrite = IoUringSQE(SocketWritePayload, struct {
-    pub fn _f(ring: *std.os.linux.IoUring, loc: u64, payload: SocketWritePayload) !void {
+pub const Write = IoUringSQE(WritePayload, struct {
+    pub fn _f(ring: *std.os.linux.IoUring, loc: u64, payload: WritePayload) !void {
         _ = try ring.write(loc, payload.client, payload.data, 0);
     }
 }._f);
@@ -159,13 +203,13 @@ pub const Writev = IoUringSQE(WritevPayload, struct {
     }
 }._f);
 
-pub const SocketReadPayload = struct {
+pub const ReadPayload = struct {
     client: i32,
     buffer: []u8,
 };
 
-pub const SocketRead = IoUringSQE(SocketReadPayload, struct {
-    pub fn _f(ring: *std.os.linux.IoUring, loc: u64, payload: SocketReadPayload) !void {
+pub const Read = IoUringSQE(ReadPayload, struct {
+    pub fn _f(ring: *std.os.linux.IoUring, loc: u64, payload: ReadPayload) !void {
         _ = try ring.recv(loc, payload.client, .{ .buffer = payload.buffer }, 0);
     }
 }._f);
@@ -175,14 +219,14 @@ pub const SocketRead = IoUringSQE(SocketReadPayload, struct {
 //
 pub const WritevAll = struct {
     pub const State = enum { Init, SQE, CQE, Done };
-    pub const Result = std.os.linux.E;
+    pub const Result = SQEError!void;
 
     client: i32,
     iovecs: []std.posix.iovec_const,
     i: usize = 0,
 
     state: State = .Init,
-    result: Result = .SUCCESS,
+    result: Result = {},
     scheduled: bool = false,
     returned_from: PendingIndex = PendingIndex.empty(),
     callback: PendingIndex = PendingIndex.empty(),
@@ -207,15 +251,11 @@ pub const WritevAll = struct {
                 }, self);
             },
             .CQE => {
-                const res = loop.result_for(Writev, self.returned_from);
-                switch (res.err()) {
-                    .SUCCESS => {},
-                    else => |err| {
-                        self.result = err;
-                        self.state = .Done;
-                        return;
-                    },
-                }
+                const res = loop.result_for(Writev, self.returned_from) catch |err| {
+                    self.result = err;
+                    self.state = .Done;
+                    return;
+                };
                 var amt: usize = @intCast(res.result);
                 while (amt >= self.iovecs[self.i].len) {
                     amt -= self.iovecs[self.i].len;
@@ -238,16 +278,6 @@ pub const WritevAll = struct {
 //
 // Example SSL Request Workload
 //
-pub const ReadStream = struct {
-    pub const ReadError = error{};
-
-    client: i32,
-
-    pub fn readv(self: @This(), iovecs: []std.posix.iovec) ReadError!usize {
-        return std.os.linux.readv(self.client, iovecs.ptr, iovecs.len);
-    }
-};
-
 pub const WriteStream = struct {
     pub const WriteError = error{};
 
@@ -258,11 +288,19 @@ pub const WriteStream = struct {
     }
 };
 
+pub const ReadStream = struct {
+    pub const ReadError = error{};
+
+    client: i32,
+
+    pub fn readv(self: @This(), iovecs: []std.posix.iovec) ReadError!usize {
+        return std.os.linux.readv(self.client, iovecs.ptr, iovecs.len);
+    }
+};
+
 pub const ReadAtLeast = struct {
     pub const State = enum { Init, CheckLen, LoopStart, Recv, Done };
-    pub const Result = vendored_tls.InitError(E)!usize;
-
-    const E = std.net.Stream.WriteError || error{ IsDir, ConnectionTimedOut, NotOpenForReading, SocketNotConnected, Canceled, TlsRecordOverflow, TlsConnectionTruncated } || error{Linux};
+    pub const Result = SQEError!usize;
 
     client: i32,
     dest: []u8,
@@ -292,7 +330,7 @@ pub const ReadAtLeast = struct {
             },
             .LoopStart => {
                 self.state = .Recv;
-                try loop.schedule_with_callback(SocketRead{
+                try loop.schedule_with_callback(Read{
                     .payload = .{
                         .client = self.client,
                         .buffer = self.dest[self.index..],
@@ -300,15 +338,11 @@ pub const ReadAtLeast = struct {
                 }, self);
             },
             .Recv => {
-                const res: CQEResult = loop.result_for(SocketRead, self.returned_from);
-                switch (res.err()) {
-                    .SUCCESS => {},
-                    else => {
-                        self.result = error.Linux;
-                        self.state = .Done;
-                        return;
-                    },
-                }
+                const res: CQEResult = loop.result_for(Read, self.returned_from) catch |err| {
+                    self.result = err;
+                    self.state = .Done;
+                    return;
+                };
                 const amt: usize = @intCast(res.result);
                 if (amt == 0) {
                     self.result = self.index;
@@ -324,11 +358,11 @@ pub const ReadAtLeast = struct {
     }
 };
 
+pub const TLSDecodeError = SQEError || error{ TlsRecordOverflow, TlsConnectionTruncated };
+
 pub const ReadAtLeastDecoder = struct {
     pub const State = enum { Init, Done };
-    pub const Result = vendored_tls.InitError(E)!void;
-
-    const E = std.net.Stream.WriteError || error{ IsDir, ConnectionTimedOut, NotOpenForReading, SocketNotConnected, Canceled, TlsRecordOverflow, TlsConnectionTruncated } || error{Linux};
+    pub const Result = TLSDecodeError!void;
 
     client: i32,
     decoder: *std.crypto.tls.Decoder,
@@ -358,7 +392,7 @@ pub const ReadAtLeastDecoder = struct {
                 self.request_amt = their_amt - existing_amt;
                 const dest = d.buf[d.cap..];
                 if (self.request_amt > dest.len) {
-                    self.result = return error.TlsRecordOverflow;
+                    self.result = error.TlsRecordOverflow;
                     self.state = .Done;
                     return;
                 }
@@ -379,7 +413,7 @@ pub const ReadAtLeastDecoder = struct {
                     return;
                 };
                 if (actual_amt < self.request_amt) {
-                    self.result = return error.TlsConnectionTruncated;
+                    self.result = error.TlsConnectionTruncated;
                     self.state = .Done;
                     return;
                 }
@@ -394,9 +428,7 @@ pub const ReadAtLeastDecoder = struct {
 
 pub const ReadAtLeastOurAmtDecoder = struct {
     pub const State = enum { Init, Done };
-    pub const Result = vendored_tls.InitError(E)!void;
-
-    const E = std.net.Stream.WriteError || error{ IsDir, ConnectionTimedOut, NotOpenForReading, SocketNotConnected, Canceled, TlsRecordOverflow, TlsConnectionTruncated } || error{Linux};
+    pub const Result = TLSDecodeError!void;
 
     client: i32,
     decoder: *std.crypto.tls.Decoder,
@@ -430,9 +462,7 @@ pub const ReadAtLeastOurAmtDecoder = struct {
 pub const TlsInit = struct {
     pub const State = enum { Init, Recv, Send, Done };
     pub const Result = vendored_tls.InitError(E)!std.crypto.tls.Client;
-
-    // TODO: clean up when all "stream" bullshit is removed, handle errno
-    const E = std.net.Stream.WriteError || error{ IsDir, ConnectionTimedOut, NotOpenForReading, SocketNotConnected, Canceled, TlsRecordOverflow, TlsConnectionTruncated } || error{Linux};
+    pub const E = TLSDecodeError;
 
     client: i32,
     host: []const u8,
@@ -460,15 +490,11 @@ pub const TlsInit = struct {
                     .done => unreachable,
                     .action => |act| switch (act) {
                         .writevAll => {
-                            const res = loop.result_for(WritevAll, self.returned_from);
-                            switch (res) {
-                                .SUCCESS => {},
-                                else => {
-                                    self.result = error.Linux;
-                                    self.state = .Done;
-                                    return;
-                                },
-                            }
+                            loop.result_for(WritevAll, self.returned_from) catch |err| {
+                                self.result = err;
+                                self.state = .Done;
+                                return;
+                            };
                             self.child_state = .{ .stream = .{ .writevAll = {} } };
                             self.state = .Send;
                             continue :outer .Send;
@@ -476,13 +502,13 @@ pub const TlsInit = struct {
                         .decoder => |dec| switch (dec) {
                             .readAtLeastOurAmt => {
                                 const res = loop.result_for(ReadAtLeastOurAmtDecoder, self.returned_from);
-                                self.child_state = .{ .stream = .{ .decoder = .{ .readAtLeastOurAmt = res catch error.Linux } } };
+                                self.child_state = .{ .stream = .{ .decoder = .{ .readAtLeastOurAmt = res } } };
                                 self.state = .Send;
                                 continue :outer .Send;
                             },
                             .readAtLeast => {
                                 const res = loop.result_for(ReadAtLeastDecoder, self.returned_from);
-                                self.child_state = .{ .stream = .{ .decoder = .{ .readAtLeast = res catch error.Linux } } };
+                                self.child_state = .{ .stream = .{ .decoder = .{ .readAtLeast = res } } };
                                 self.state = .Send;
                                 continue :outer .Send;
                             },
@@ -491,7 +517,11 @@ pub const TlsInit = struct {
                 }
             },
             .Send => {
-                self.last_action = try self.tls_init.run(E, self.child_state);
+                self.last_action = self.tls_init.run(E, self.child_state) catch |err| {
+                    self.result = err;
+                    self.state = .Done;
+                    return;
+                };
                 switch (self.last_action) {
                     .done => |client| {
                         self.result = client;
@@ -539,7 +569,7 @@ pub const TlsInit = struct {
 
 pub const ExampleSSLRequest = struct {
     pub const State = enum { Connect, Write, PostWrite, Done };
-    pub const Result = CQEResult;
+    pub const Result = SQEError!void;
 
     client: i32,
     address: *std.net.Address,
@@ -565,14 +595,13 @@ pub const ExampleSSLRequest = struct {
                 }, self);
             },
             .Write => {
-                const res = loop.result_for(Connect, self.returned_from);
-                switch (res.err()) {
-                    .SUCCESS => {
-                        std.debug.print("Connect Success\n", .{});
-                        try loop.schedule(WriteStdout{ .payload = "Connect Success (io_uring)\n" });
-                    },
-                    else => |err| std.debug.print("Connect Err: {}\n", .{err}),
-                }
+                _ = loop.result_for(Connect, self.returned_from) catch |err| {
+                    std.debug.print("Connect Err: {}\n", .{err});
+                    self.state = .Done;
+                    return;
+                };
+                std.debug.print("Connect Success\n", .{});
+                try loop.schedule(WriteStdout{ .payload = "Connect Success (io_uring)\n" });
 
                 self.state = .PostWrite;
                 try loop.schedule_with_callback(TlsInit{
@@ -586,90 +615,32 @@ pub const ExampleSSLRequest = struct {
                 }, self);
             },
             .PostWrite => {
-                self.tls_client.* = try loop.result_for(TlsInit, self.returned_from);
+                self.tls_client.* = loop.result_for(TlsInit, self.returned_from) catch |err| {
+                    std.debug.print("TlsInit Err: {!}\n", .{err});
+                    self.state = .Done;
+                    return;
+                };
                 std.debug.print("TLS Initialized\n", .{});
 
                 const buffer_send = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
                 const write_stream = WriteStream{ .client = self.client };
-                _ = try self.tls_client.write(write_stream, buffer_send);
+                _ = self.tls_client.write(write_stream, buffer_send) catch |err| {
+                    std.debug.print("Write Err: {!}\n", .{err});
+                    self.state = .Done;
+                    return;
+                };
 
                 const read_stream = ReadStream{ .client = self.client };
-                const read_size = try self.tls_client.read(read_stream, loop.context.recv[0..]);
+                const read_size = self.tls_client.read(read_stream, loop.context.recv[0..]) catch |err| {
+                    std.debug.print("Read Err: {!}\n", .{err});
+                    self.state = .Done;
+                    return;
+                };
                 const result = loop.context.recv[0..read_size];
                 std.debug.print("Read Success: {} {s}\n", .{ result.len, result[0..100] });
                 self.state = .Done;
             },
             .Done => {},
-        }
-    }
-};
-
-//
-// Example Request Workload
-//
-pub const ExampleRequest = struct {
-    pub const State = enum { Connect, Write, Read, Done };
-    pub const Result = CQEResult;
-
-    client: i32,
-    address: *std.net.Address,
-
-    state: State = .Connect,
-    result: Result = undefined,
-    scheduled: bool = false,
-    returned_from: PendingIndex = PendingIndex.empty(),
-    callback: PendingIndex = PendingIndex.empty(),
-
-    pub fn run(self: *@This(), loop: anytype) !void {
-        switch (self.state) {
-            .Connect => {
-                self.state = .Write;
-                try loop.schedule_with_callback(Connect{
-                    .payload = .{
-                        .client = self.client,
-                        .address = self.address,
-                    },
-                }, self);
-            },
-            .Write => {
-                const res = loop.result_for(Connect, self.returned_from);
-                switch (res.err()) {
-                    .SUCCESS => {
-                        std.debug.print("Connect Success\n", .{});
-                        try loop.schedule(WriteStdout{ .payload = "Connect Success (io_uring)\n" });
-                    },
-                    else => |err| std.debug.print("Connect Err: {}\n", .{err}),
-                }
-                const buffer_send = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
-                self.state = .Read;
-                try loop.schedule_with_callback(SocketWrite{
-                    .payload = .{
-                        .client = self.client,
-                        .data = buffer_send[0..],
-                    },
-                }, self);
-            },
-            .Read => {
-                const res = loop.result_for(SocketWrite, self.returned_from);
-                switch (res.err()) {
-                    .SUCCESS => std.debug.print("Write Success\n", .{}),
-                    else => |err| std.debug.print("Write Err: {}\n", .{err}),
-                }
-                self.state = .Done;
-                try loop.schedule_with_callback(SocketRead{
-                    .payload = .{
-                        .client = self.client,
-                        .buffer = loop.context.recv[0..],
-                    },
-                }, self);
-            },
-            .Done => {
-                const res = loop.result_for(SocketRead, self.returned_from);
-                switch (res.err()) {
-                    .SUCCESS => std.debug.print("Read Success ({})\n\n{s}\n", .{ res.result, loop.context.recv[0..@intCast(res.result)] }),
-                    else => |err| std.debug.print("Read Err: {}\n", .{err}),
-                }
-            },
         }
     }
 };
@@ -761,7 +732,7 @@ pub fn Loop(events: []const type, Context: type) type {
                 loop: *Self,
                 loc: PendingIndex,
 
-                pub fn store(self: @This(), event: Event) !void {
+                pub fn store(self: @This(), event: Event) void {
                     self.loop.pending.getByType(Event).set(self.loc.pool_index, event);
                 }
             };
@@ -779,7 +750,10 @@ pub fn Loop(events: []const type, Context: type) type {
                 if (i == loc.tuple_index) {
                     var pool = self.pending.getByIndex(i);
                     var event = pool.get(loc.pool_index);
-                    // TODO: This API is incredibly error-prone
+                    // Assert for logical clarity, if-statement
+                    // to allow the following setter to not
+                    // be a compile error
+                    std.debug.assert(@TypeOf(event).Result == Result);
                     if (@TypeOf(event).Result != Result)
                         unreachable;
                     event.result = result;
@@ -886,7 +860,6 @@ pub fn Loop(events: []const type, Context: type) type {
                             }
                         }
 
-                        // TODO: Think through this more carefully
                         if (event.scheduled)
                             continue;
 
@@ -952,7 +925,7 @@ pub fn main() !void {
         tls_init: vendored_tls.TlsInit,
     };
 
-    var loop = try Loop(&[_]type{ Timeout, WriteStdout, CQEResultPendingEvent, PollCompletions, Connect, SocketWrite, SocketRead, ExampleRequest, ExampleSSLRequest, TlsInit, WritevAll, Writev, ReadAtLeastOurAmtDecoder, ReadAtLeastDecoder, ReadAtLeast }, Context).init(std.heap.smp_allocator, .{
+    var loop = try Loop(&[_]type{ LoopTimeout, WriteStdout, CQEResultPendingEvent, PollCompletions, Connect, Write, Read, ExampleSSLRequest, TlsInit, WritevAll, Writev, ReadAtLeastOurAmtDecoder, ReadAtLeastDecoder, ReadAtLeast }, Context).init(std.heap.smp_allocator, .{
         .ring = &ring.ring,
         .recv = undefined,
         .tls_client = undefined,
@@ -964,7 +937,7 @@ pub fn main() !void {
     try bundle.rescan(allocator);
     defer bundle.deinit(allocator);
 
-    try loop.schedule(Timeout.init(std.time.ns_per_s));
+    try loop.schedule(LoopTimeout.init(std.time.ns_per_s));
     try loop.schedule(ExampleSSLRequest{ .client = @intCast(client), .address = &address, .bundle = &bundle });
     try loop.schedule(PollCompletions{});
     try loop.run();
