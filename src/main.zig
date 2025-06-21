@@ -5,11 +5,48 @@ const PendingIndex = @import("loop.zig").PendingIndex;
 const default_initialize = @import("mem.zig").default_initialize;
 const Ring = @import("io_uring.zig").Ring;
 
+//
+// Event Combinators
+//
+pub fn IoUringSQE(Payload: type, submit: anytype) type {
+    return struct {
+        pub const State = enum { Submitting, Done };
+        pub const Result = CQEResult;
+
+        payload: Payload,
+
+        state: State = .Submitting,
+        result: Result = undefined,
+        scheduled: bool = false,
+        returned_from: PendingIndex = PendingIndex.empty(),
+        callback: PendingIndex = PendingIndex.empty(),
+
+        pub fn run(self: *@This(), loop: anytype) !void {
+            switch (self.state) {
+                .Submitting => {
+                    const pwc = try loop.pend_with_callback(CQEResultPendingEvent{}, self);
+                    const ring: *std.os.linux.IoUring = loop.context.ring;
+                    self.state = .Done;
+                    try submit(ring, pwc.pend_loc.to_u64(), self.payload);
+                    try pwc.store.store(self.*);
+                },
+                .Done => {
+                    self.result = loop.result_for(CQEResultPendingEvent, self.returned_from);
+                },
+            }
+        }
+    };
+}
+
+//
+// Recurring, bookkeeping events
+//
 const Timeout = struct {
     pub const State = enum { Waiting, Done };
     pub const Result = void;
 
     deadline_ns: i128,
+
     state: State = .Waiting,
     result: Result = {},
     scheduled: bool = false,
@@ -38,33 +75,6 @@ pub const CQEResult = struct {
     }
 };
 
-pub const WriteStdout = struct {
-    pub const State = enum { Writing, Done };
-    pub const Result = CQEResult;
-
-    data: []const u8,
-
-    state: State = .Writing,
-    result: Result = undefined,
-    scheduled: bool = false,
-    returned_from: PendingIndex = PendingIndex.empty(),
-    callback: PendingIndex = PendingIndex.empty(),
-
-    pub fn run(self: *@This(), loop: anytype) !void {
-        switch (self.state) {
-            .Writing => {
-                const pwc = try loop.pend_with_callback(CQEResultPendingEvent{}, self);
-                _ = try loop.context.ring.write(pwc.pend_loc.to_u64(), std.os.linux.STDOUT_FILENO, self.data, 0);
-                self.state = .Done;
-                try pwc.store.store(self.*);
-            },
-            .Done => {
-                self.result = loop.result_for(CQEResultPendingEvent, self.returned_from);
-            },
-        }
-    }
-};
-
 pub const CQEResultPendingEvent = struct {
     pub const State = enum { Done };
     pub const Result = CQEResult;
@@ -78,8 +88,8 @@ pub const CQEResultPendingEvent = struct {
     pub fn run(_: *@This(), _: anytype) !void {}
 };
 
-// Schedules any CQE callbacks and submits any pending SQEs
 pub const PollCompletions = struct {
+    // Schedules any CQE callbacks and submits any pending SQEs
     pub const State = enum { Unpend, Done };
     pub const Result = void;
 
@@ -105,6 +115,122 @@ pub const PollCompletions = struct {
     }
 };
 
+//
+// IoUring Events
+//
+pub const WriteStdout = IoUringSQE([]const u8, struct {
+    pub fn _f(ring: *std.os.linux.IoUring, loc: u64, data: []const u8) !void {
+        _ = try ring.write(loc, std.os.linux.STDOUT_FILENO, data, 0);
+    }
+}._f);
+
+pub const ConnectPayload = struct {
+    client: i32,
+    address: *const std.net.Address,
+};
+
+pub const Connect = IoUringSQE(ConnectPayload, struct {
+    pub fn _f(ring: *std.os.linux.IoUring, loc: u64, payload: ConnectPayload) !void {
+        _ = try ring.connect(loc, payload.client, &payload.address.any, payload.address.getOsSockLen());
+    }
+}._f);
+
+pub const SocketWritePayload = struct {
+    client: i32,
+    data: []const u8,
+};
+
+pub const SocketWrite = IoUringSQE(SocketWritePayload, struct {
+    pub fn _f(ring: *std.os.linux.IoUring, loc: u64, payload: SocketWritePayload) !void {
+        _ = try ring.write(loc, payload.client, payload.data, 0);
+    }
+}._f);
+
+pub const SocketReadPayload = struct {
+    client: i32,
+    buffer: []u8,
+};
+
+pub const SocketRead = IoUringSQE(SocketReadPayload, struct {
+    pub fn _f(ring: *std.os.linux.IoUring, loc: u64, payload: SocketReadPayload) !void {
+        _ = try ring.recv(loc, payload.client, .{ .buffer = payload.buffer }, 0);
+    }
+}._f);
+
+//
+// Example Request Workload
+//
+pub const ExampleRequest = struct {
+    pub const State = enum { Connect, Write, Read, Done };
+    pub const Result = CQEResult;
+
+    client: i32,
+    address: *std.net.Address,
+
+    state: State = .Connect,
+    result: Result = undefined,
+    scheduled: bool = false,
+    returned_from: PendingIndex = PendingIndex.empty(),
+    callback: PendingIndex = PendingIndex.empty(),
+
+    pub fn run(self: *@This(), loop: anytype) !void {
+        switch (self.state) {
+            .Connect => {
+                self.state = .Write;
+                try loop.schedule_with_callback(Connect{
+                    .payload = .{
+                        .client = self.client,
+                        .address = self.address,
+                    },
+                }, self);
+            },
+            .Write => {
+                const res = loop.result_for(Connect, self.returned_from);
+                switch (res.err()) {
+                    .SUCCESS => {
+                        std.debug.print("Connect Success\n", .{});
+                        try loop.schedule(WriteStdout{ .payload = "Connect Success (io_uring)\n" });
+                    },
+                    else => |err| std.debug.print("Connect Err: {}\n", .{err}),
+                }
+                const buffer_send = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+                self.state = .Read;
+                try loop.schedule_with_callback(SocketWrite{
+                    .payload = .{
+                        .client = self.client,
+                        .data = buffer_send[0..],
+                    },
+                }, self);
+            },
+            .Read => {
+                // TODO: The API for `result_for` is incredibly error-prone
+                const res = loop.result_for(SocketWrite, self.returned_from);
+                switch (res.err()) {
+                    .SUCCESS => std.debug.print("Write Success\n", .{}),
+                    else => |err| std.debug.print("Write Err: {}\n", .{err}),
+                }
+                self.state = .Done;
+                try loop.schedule_with_callback(SocketRead{
+                    .payload = .{
+                        .client = self.client,
+                        .buffer = loop.context.recv[0..],
+                    },
+                }, self);
+            },
+            .Done => {
+                const res = loop.result_for(SocketRead, self.returned_from);
+                switch (res.err()) {
+                    .SUCCESS => std.debug.print("Read Success ({})\n\n{s}\n", .{ res.result, loop.context.recv[0..@intCast(res.result)] }),
+                    else => |err| std.debug.print("Read Err: {}\n", .{err}),
+                }
+            },
+        }
+    }
+};
+
+//
+// Loop
+//
 pub fn Loop(events: []const type, Context: type) type {
     for (events) |T| {
         if (@sizeOf(T) <= 0)
@@ -202,6 +328,7 @@ pub fn Loop(events: []const type, Context: type) type {
                 if (i == loc.tuple_index) {
                     var pool = self.pending.getByIndex(i);
                     var event = pool.get(loc.pool_index);
+                    // TODO: This API is incredibly error-prone
                     if (@TypeOf(event).Result != Result)
                         unreachable;
                     event.result = result;
@@ -308,6 +435,10 @@ pub fn Loop(events: []const type, Context: type) type {
                             }
                         }
 
+                        // TODO: Think through this more carefully
+                        if (event.scheduled)
+                            continue;
+
                         if (event.state == .Done) {
                             const callback: PendingIndex = event.callback;
                             if (!callback.is_empty()) {
@@ -330,7 +461,7 @@ pub fn Loop(events: []const type, Context: type) type {
                                     }
                                 }
                             }
-                        } else if (!event.scheduled) {
+                        } else {
                             try self.schedule(event);
                         }
                     }
@@ -357,21 +488,23 @@ pub fn main() !void {
     if (address_list.addrs.len < 1)
         return error.DnsLookupFailure;
 
-    const address = address_list.addrs[0];
+    var address = address_list.addrs[0];
     const client = std.os.linux.socket(address.any.family, std.os.linux.SOCK.STREAM | std.os.linux.SOCK.CLOEXEC, 0);
     defer _ = std.os.linux.close(@intCast(client));
 
     const Context = struct {
         ring: *std.os.linux.IoUring,
+        recv: [1024 * 64]u8,
     };
 
-    var loop = try Loop(&[_]type{ Timeout, WriteStdout, CQEResultPendingEvent, PollCompletions }, Context).init(std.heap.smp_allocator, .{
+    var loop = try Loop(&[_]type{ Timeout, WriteStdout, CQEResultPendingEvent, PollCompletions, Connect, SocketWrite, SocketRead, ExampleRequest }, Context).init(std.heap.smp_allocator, .{
         .ring = &ring.ring,
+        .recv = undefined,
     });
     defer loop.deinit();
 
-    try loop.schedule(Timeout.init(std.time.ns_per_ms));
-    try loop.schedule(WriteStdout{ .data = "Hello, io_uring World!\n" });
+    try loop.schedule(Timeout.init(std.time.ns_per_s));
+    try loop.schedule(ExampleRequest{ .client = @intCast(client), .address = &address });
     try loop.schedule(PollCompletions{});
     try loop.run();
 }
