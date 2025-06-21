@@ -5,6 +5,8 @@ const PendingIndex = @import("loop.zig").PendingIndex;
 const default_initialize = @import("mem.zig").default_initialize;
 const Ring = @import("io_uring.zig").Ring;
 
+const assert = std.debug.assert;
+
 const vendored_tls = @import("tls.zig");
 
 //
@@ -217,6 +219,7 @@ pub const Read = IoUringSQE(ReadPayload, struct {
 //
 // IoUring Composite Events
 //
+
 pub const WritevAll = struct {
     pub const State = enum { Init, SQE, CQE, Done };
     pub const Result = SQEError!void;
@@ -316,7 +319,7 @@ pub const ReadAtLeast = struct {
     pub fn run(self: *@This(), loop: anytype) !void {
         outer: switch (self.state) {
             .Init => {
-                std.debug.assert(self.request_amt < self.dest.len);
+                assert(self.request_amt < self.dest.len);
                 self.state = .CheckLen;
                 continue :outer .CheckLen;
             },
@@ -381,7 +384,7 @@ pub const ReadAtLeastDecoder = struct {
                 const d = self.decoder;
                 const their_amt = self.their_amt;
 
-                std.debug.assert(!d.disable_reads);
+                assert(!d.disable_reads);
                 const existing_amt = d.cap - d.idx;
                 d.their_end = d.idx + their_amt;
                 if (their_amt <= existing_amt) {
@@ -443,7 +446,7 @@ pub const ReadAtLeastOurAmtDecoder = struct {
     pub fn run(self: *@This(), loop: anytype) !void {
         switch (self.state) {
             .Init => {
-                std.debug.assert(!self.decoder.disable_reads);
+                assert(!self.decoder.disable_reads);
                 self.state = .Done;
                 try loop.schedule_with_callback(ReadAtLeastDecoder{
                     .client = self.client,
@@ -572,7 +575,536 @@ pub const TlsWriteState = struct {
     ciphertext_buf: [std.crypto.tls.max_ciphertext_record_len * 4]u8 = undefined,
 };
 
-/// Returns the number of cleartext bytes sent, which may be fewer than `bytes.len`.
+pub const TlsReadState = struct {
+    in_stack_buffer: [vendored_tls.max_ciphertext_len * 4]u8 = undefined,
+    vp: vendored_tls.VecPut = undefined,
+    cleartext_stack_buffer: [vendored_tls.max_ciphertext_len]u8 = undefined,
+    iovecs: [1]std.posix.iovec = undefined,
+};
+
+pub const TlsReadvAdvanced = struct {
+    pub const State = enum { Init, CQE, Done };
+    pub const Result = SQEError!usize;
+
+    client: i32,
+    tls_client: *std.crypto.tls.Client,
+    iovecs: []const std.posix.iovec,
+    read_state: *TlsReadState,
+
+    vp: vendored_tls.VecPut = undefined,
+    first_iov: []const u8 = undefined,
+    iovec_end: usize = undefined,
+    overhead_len: usize = undefined,
+    i: usize = 0,
+    total_amt: usize = 0,
+    actual_read_len: usize = undefined,
+
+    state: State = .Init,
+    result: Result = undefined,
+    scheduled: bool = false,
+    returned_from: PendingIndex = PendingIndex.empty(),
+    callback: PendingIndex = PendingIndex.empty(),
+
+    pub fn run(self: *@This(), loop: anytype) !void {
+        _ = loop;
+        const c = self.tls_client;
+        const iovecs = self.iovecs;
+
+        outer: switch (self.state) {
+            .Init => {
+                self.read_state.vp = .{ .iovecs = iovecs };
+
+                // Give away the buffered cleartext we have, if any.
+                const partial_cleartext = c.partially_read_buffer[c.partial_cleartext_idx..c.partial_ciphertext_idx];
+                if (partial_cleartext.len > 0) {
+                    const amt: u15 = @intCast(self.read_state.vp.put(partial_cleartext));
+                    c.partial_cleartext_idx += amt;
+
+                    if (c.partial_cleartext_idx == c.partial_ciphertext_idx and
+                        c.partial_ciphertext_end == c.partial_ciphertext_idx)
+                    {
+                        // The buffer is now empty.
+                        c.partial_cleartext_idx = 0;
+                        c.partial_ciphertext_idx = 0;
+                        c.partial_ciphertext_end = 0;
+                    }
+
+                    if (c.received_close_notify) {
+                        c.partial_ciphertext_end = 0;
+                        assert(self.read_state.vp.total == amt);
+                        self.result = amt;
+                        self.state = .Done;
+                        return;
+                    } else if (amt > 0) {
+                        // We don't need more data, so don't call read.
+                        assert(self.read_state.vp.total == amt);
+                        self.result = amt;
+                        self.state = .Done;
+                        return;
+                    }
+                }
+
+                assert(!c.received_close_notify);
+
+                // How many bytes left in the user's buffer.
+                const free_size = self.read_state.vp.freeSize();
+                // The amount of the user's buffer that we need to repurpose for storing
+                // ciphertext. The end of the buffer will be used for such purposes.
+                const ciphertext_buf_len = (free_size / 2) -| self.read_state.in_stack_buffer.len;
+                // The amount of the user's buffer that will be used to give cleartext. The
+                // beginning of the buffer will be used for such purposes.
+                const cleartext_buf_len = free_size - ciphertext_buf_len;
+
+                // Recoup `partially_read_buffer` space. This is necessary because it is assumed
+                // below that `frag0` is big enough to hold at least one record.
+                vendored_tls.limitedOverlapCopy(c.partially_read_buffer[0..c.partial_ciphertext_end], c.partial_ciphertext_idx);
+                c.partial_ciphertext_end -= c.partial_ciphertext_idx;
+                c.partial_ciphertext_idx = 0;
+                c.partial_cleartext_idx = 0;
+                self.first_iov = c.partially_read_buffer[c.partial_ciphertext_end..];
+
+                var ask_iovecs_buf: [2]std.posix.iovec = .{
+                    .{
+                        .base = self.first_iov.ptr,
+                        .len = self.first_iov.len,
+                    },
+                    .{
+                        .base = &self.read_state.in_stack_buffer,
+                        .len = self.read_state.in_stack_buffer.len,
+                    },
+                };
+
+                // Cleartext capacity of output buffer, in records. Minimum one full record.
+                const buf_cap = @max(cleartext_buf_len / vendored_tls.max_ciphertext_len, 1);
+                const wanted_read_len = buf_cap * (vendored_tls.max_ciphertext_len + std.crypto.tls.record_header_len);
+                const ask_len = @max(wanted_read_len, self.read_state.cleartext_stack_buffer.len) - c.partial_ciphertext_end;
+                const ask_iovecs = vendored_tls.limitVecs(&ask_iovecs_buf, ask_len);
+
+                // TODO: async
+                self.actual_read_len = std.os.linux.readv(self.client, ask_iovecs.ptr, ask_iovecs.len);
+                self.state = .CQE;
+                continue :outer .CQE;
+            },
+            .CQE => {
+                // const res = loop.result_for(Readv, self.returned_from) catch |err| {
+                //     self.result = err;
+                //     self.state = .Done;
+                //     return;
+                // };
+                // const actual_read_len: usize = @intCast(res.result);
+
+                const actual_read_len: usize = self.actual_read_len;
+                if (actual_read_len == 0) {
+                    // This is either a truncation attack, a bug in the server, or an
+                    // intentional omission of the close_notify message due to truncation
+                    // detection handled above the TLS layer.
+                    if (c.allow_truncation_attacks) {
+                        c.received_close_notify = true;
+                    } else {
+                        self.result = error.TlsConnectionTruncated;
+                        self.state = .Done;
+                        return;
+                    }
+                }
+
+                // There might be more bytes inside `in_stack_buffer` that need to be processed,
+                // but at least frag0 will have one complete ciphertext record.
+                const frag0_end = @min(c.partially_read_buffer.len, c.partial_ciphertext_end + actual_read_len);
+                const frag0 = c.partially_read_buffer[c.partial_ciphertext_idx..frag0_end];
+                var frag1 = self.read_state.in_stack_buffer[0..actual_read_len -| self.first_iov.len];
+                // We need to decipher frag0 and frag1 but there may be a ciphertext record
+                // straddling the boundary. We can handle this with two memcpy() calls to
+                // assemble the straddling record in between handling the two sides.
+                var frag = frag0;
+                var in: usize = 0;
+                while (true) {
+                    if (in == frag.len) {
+                        // Perfect split.
+                        if (frag.ptr == frag1.ptr) {
+                            c.partial_ciphertext_end = c.partial_ciphertext_idx;
+                            self.result = self.read_state.vp.total;
+                            self.state = .Done;
+                            return;
+                        }
+                        frag = frag1;
+                        in = 0;
+                        continue;
+                    }
+
+                    if (in + std.crypto.tls.record_header_len > frag.len) {
+                        if (frag.ptr == frag1.ptr) {
+                            self.result = vendored_tls.finishRead(c, frag, in, self.read_state.vp.total);
+                            self.state = .Done;
+                            return;
+                        }
+
+                        const first = frag[in..];
+
+                        if (frag1.len < std.crypto.tls.record_header_len) {
+                            self.result = vendored_tls.finishRead2(c, first, frag1, self.read_state.vp.total);
+                            self.state = .Done;
+                            return;
+                        }
+
+                        // A record straddles the two fragments. Copy into the now-empty first fragment.
+                        const record_len_byte_0: u16 = vendored_tls.straddleByte(frag, frag1, in + 3);
+                        const record_len_byte_1: u16 = vendored_tls.straddleByte(frag, frag1, in + 4);
+                        const record_len = (record_len_byte_0 << 8) | record_len_byte_1;
+                        if (record_len > vendored_tls.max_ciphertext_len) {
+                            self.result = error.TlsRecordOverflow;
+                            self.state = .Done;
+                            return;
+                        }
+
+                        const full_record_len = record_len + std.crypto.tls.record_header_len;
+                        const second_len = full_record_len - first.len;
+                        if (frag1.len < second_len) {
+                            self.result = vendored_tls.finishRead2(c, first, frag1, self.read_state.vp.total);
+                            self.state = .Done;
+                            return;
+                        }
+
+                        vendored_tls.limitedOverlapCopy(frag, in);
+                        @memcpy(frag[first.len..][0..second_len], frag1[0..second_len]);
+                        frag = frag[0..full_record_len];
+                        frag1 = frag1[second_len..];
+                        in = 0;
+                        continue;
+                    }
+                    const ct: std.crypto.tls.ContentType = @enumFromInt(frag[in]);
+                    in += 1;
+                    const legacy_version = std.mem.readInt(u16, frag[in..][0..2], .big);
+                    in += 2;
+                    _ = legacy_version;
+                    const record_len = std.mem.readInt(u16, frag[in..][0..2], .big);
+                    if (record_len > vendored_tls.max_ciphertext_len) {
+                        self.result = error.TlsRecordOverflow;
+                        self.state = .Done;
+                        return;
+                    }
+                    in += 2;
+                    const end = in + record_len;
+                    if (end > frag.len) {
+                        // We need the record header on the next iteration of the loop.
+                        in -= std.crypto.tls.record_header_len;
+
+                        if (frag.ptr == frag1.ptr) {
+                            self.result = vendored_tls.finishRead(c, frag, in, self.read_state.vp.total);
+                            self.state = .Done;
+                            return;
+                        }
+
+                        // A record straddles the two fragments. Copy into the now-empty first fragment.
+                        const first = frag[in..];
+                        const full_record_len = record_len + std.crypto.tls.record_header_len;
+                        const second_len = full_record_len - first.len;
+                        if (frag1.len < second_len) {
+                            self.result = vendored_tls.finishRead2(c, first, frag1, self.read_state.vp.total);
+                            self.state = .Done;
+                            return;
+                        }
+
+                        vendored_tls.limitedOverlapCopy(frag, in);
+                        @memcpy(frag[first.len..][0..second_len], frag1[0..second_len]);
+                        frag = frag[0..full_record_len];
+                        frag1 = frag1[second_len..];
+                        in = 0;
+                        continue;
+                    }
+                    const cleartext, const inner_ct: std.crypto.tls.ContentType = cleartext: switch (c.application_cipher) {
+                        inline else => |*p| switch (c.tls_version) {
+                            .tls_1_3 => {
+                                const pv = &p.tls_1_3;
+                                const P = @TypeOf(p.*);
+                                const ad = frag[in - std.crypto.tls.record_header_len ..][0..std.crypto.tls.record_header_len];
+                                const ciphertext_len = record_len - P.AEAD.tag_length;
+                                const ciphertext = frag[in..][0..ciphertext_len];
+                                in += ciphertext_len;
+                                const auth_tag = frag[in..][0..P.AEAD.tag_length].*;
+                                const nonce = nonce: {
+                                    const V = @Vector(P.AEAD.nonce_length, u8);
+                                    const pad = [1]u8{0} ** (P.AEAD.nonce_length - 8);
+                                    const operand: V = pad ++ std.mem.toBytes(vendored_tls.big(c.read_seq));
+                                    break :nonce @as(V, pv.server_iv) ^ operand;
+                                };
+                                const out_buf = self.read_state.vp.peek();
+                                const cleartext_buf = if (ciphertext.len <= out_buf.len)
+                                    out_buf
+                                else
+                                    &self.read_state.cleartext_stack_buffer;
+                                const cleartext = cleartext_buf[0..ciphertext.len];
+                                P.AEAD.decrypt(cleartext, ciphertext, auth_tag, ad, nonce, pv.server_key) catch {
+                                    self.result = error.TlsBadRecordMac;
+                                    self.state = .Done;
+                                    return;
+                                };
+                                const msg = std.mem.trimEnd(u8, cleartext, "\x00");
+                                break :cleartext .{ msg[0 .. msg.len - 1], @enumFromInt(msg[msg.len - 1]) };
+                            },
+                            .tls_1_2 => {
+                                const pv = &p.tls_1_2;
+                                const P = @TypeOf(p.*);
+                                const message_len: u16 = record_len - P.record_iv_length - P.mac_length;
+                                const ad = std.mem.toBytes(vendored_tls.big(c.read_seq)) ++
+                                    frag[in - std.crypto.tls.record_header_len ..][0 .. 1 + 2] ++
+                                    std.mem.toBytes(vendored_tls.big(message_len));
+                                const record_iv = frag[in..][0..P.record_iv_length].*;
+                                in += P.record_iv_length;
+                                const masked_read_seq = c.read_seq &
+                                    comptime std.math.shl(u64, std.math.maxInt(u64), 8 * P.record_iv_length);
+                                const nonce: [P.AEAD.nonce_length]u8 = nonce: {
+                                    const V = @Vector(P.AEAD.nonce_length, u8);
+                                    const pad = [1]u8{0} ** (P.AEAD.nonce_length - 8);
+                                    const operand: V = pad ++ @as([8]u8, @bitCast(vendored_tls.big(masked_read_seq)));
+                                    break :nonce @as(V, pv.server_write_IV ++ record_iv) ^ operand;
+                                };
+                                const ciphertext = frag[in..][0..message_len];
+                                in += message_len;
+                                const auth_tag = frag[in..][0..P.mac_length].*;
+                                in += P.mac_length;
+                                const out_buf = self.read_state.vp.peek();
+                                const cleartext_buf = if (message_len <= out_buf.len)
+                                    out_buf
+                                else
+                                    &self.read_state.cleartext_stack_buffer;
+                                const cleartext = cleartext_buf[0..ciphertext.len];
+                                P.AEAD.decrypt(cleartext, ciphertext, auth_tag, ad, nonce, pv.server_write_key) catch {
+                                    self.result = error.TlsBadRecordMac;
+                                    self.state = .Done;
+                                    return;
+                                };
+                                break :cleartext .{ cleartext, ct };
+                            },
+                            else => unreachable,
+                        },
+                    };
+                    c.read_seq = std.math.add(u64, c.read_seq, 1) catch |err| {
+                        self.result = err;
+                        self.state = .Done;
+                        return;
+                    };
+                    switch (inner_ct) {
+                        .alert => {
+                            if (cleartext.len != 2) {
+                                self.result = error.TlsDecodeError;
+                                self.state = .Done;
+                                return;
+                            }
+                            const level: std.crypto.tls.AlertLevel = @enumFromInt(cleartext[0]);
+                            const desc: std.crypto.tls.AlertDescription = @enumFromInt(cleartext[1]);
+                            if (desc == .close_notify) {
+                                c.received_close_notify = true;
+                                c.partial_ciphertext_end = c.partial_ciphertext_idx;
+                                self.result = self.read_state.vp.total;
+                                self.state = .Done;
+                                return;
+                            }
+                            _ = level;
+
+                            desc.toError() catch |err| {
+                                self.result = err;
+                                self.state = .Done;
+                                return;
+                            };
+                            // TODO: handle server-side closures
+                            self.result = error.TlsUnexpectedMessage;
+                            self.state = .Done;
+                            return;
+                        },
+                        .handshake => {
+                            var ct_i: usize = 0;
+                            while (true) {
+                                const handshake_type: std.crypto.tls.HandshakeType = @enumFromInt(cleartext[ct_i]);
+                                ct_i += 1;
+                                const handshake_len = std.mem.readInt(u24, cleartext[ct_i..][0..3], .big);
+                                ct_i += 3;
+                                const next_handshake_i = ct_i + handshake_len;
+                                if (next_handshake_i > cleartext.len) {
+                                    self.result = error.TlsBadLength;
+                                    self.state = .Done;
+                                    return;
+                                }
+                                const handshake = cleartext[ct_i..next_handshake_i];
+                                switch (handshake_type) {
+                                    .new_session_ticket => {
+                                        // This client implementation ignores new session tickets.
+                                    },
+                                    .key_update => {
+                                        switch (c.application_cipher) {
+                                            inline else => |*p| {
+                                                const pv = &p.tls_1_3;
+                                                const P = @TypeOf(p.*);
+                                                const server_secret = vendored_tls.hkdfExpandLabel(P.Hkdf, pv.server_secret, "traffic upd", "", P.Hash.digest_length);
+                                                if (c.ssl_key_log) |*key_log| vendored_tls.logSecrets(key_log.file, .{
+                                                    .counter = key_log.serverCounter(),
+                                                    .client_random = &key_log.client_random,
+                                                }, .{
+                                                    .SERVER_TRAFFIC_SECRET = &server_secret,
+                                                });
+                                                pv.server_secret = server_secret;
+                                                pv.server_key = vendored_tls.hkdfExpandLabel(P.Hkdf, server_secret, "key", "", P.AEAD.key_length);
+                                                pv.server_iv = vendored_tls.hkdfExpandLabel(P.Hkdf, server_secret, "iv", "", P.AEAD.nonce_length);
+                                            },
+                                        }
+                                        c.read_seq = 0;
+
+                                        switch (@as(std.crypto.tls.KeyUpdateRequest, @enumFromInt(handshake[0]))) {
+                                            .update_requested => {
+                                                switch (c.application_cipher) {
+                                                    inline else => |*p| {
+                                                        const pv = &p.tls_1_3;
+                                                        const P = @TypeOf(p.*);
+                                                        const client_secret = vendored_tls.hkdfExpandLabel(P.Hkdf, pv.client_secret, "traffic upd", "", P.Hash.digest_length);
+                                                        if (c.ssl_key_log) |*key_log| vendored_tls.logSecrets(key_log.file, .{
+                                                            .counter = key_log.clientCounter(),
+                                                            .client_random = &key_log.client_random,
+                                                        }, .{
+                                                            .CLIENT_TRAFFIC_SECRET = &client_secret,
+                                                        });
+                                                        pv.client_secret = client_secret;
+                                                        pv.client_key = vendored_tls.hkdfExpandLabel(P.Hkdf, client_secret, "key", "", P.AEAD.key_length);
+                                                        pv.client_iv = vendored_tls.hkdfExpandLabel(P.Hkdf, client_secret, "iv", "", P.AEAD.nonce_length);
+                                                    },
+                                                }
+                                                c.write_seq = 0;
+                                            },
+                                            .update_not_requested => {},
+                                            _ => {
+                                                self.result = error.TlsIllegalParameter;
+                                                self.state = .Done;
+                                                return;
+                                            },
+                                        }
+                                    },
+                                    else => {
+                                        self.result = error.TlsUnexpectedMessage;
+                                        self.state = .Done;
+                                        return;
+                                    },
+                                }
+                                ct_i = next_handshake_i;
+                                if (ct_i >= cleartext.len) break;
+                            }
+                        },
+                        .application_data => {
+                            // Determine whether the output buffer or a stack
+                            // buffer was used for storing the cleartext.
+                            if (cleartext.ptr == &self.read_state.cleartext_stack_buffer) {
+                                // Stack buffer was used, so we must copy to the output buffer.
+                                if (c.partial_ciphertext_idx > c.partial_cleartext_idx) {
+                                    // We have already run out of room in iovecs. Continue
+                                    // appending to `partially_read_buffer`.
+                                    @memcpy(
+                                        c.partially_read_buffer[c.partial_ciphertext_idx..][0..cleartext.len],
+                                        cleartext,
+                                    );
+                                    c.partial_ciphertext_idx = @intCast(c.partial_ciphertext_idx + cleartext.len);
+                                } else {
+                                    const amt = self.read_state.vp.put(cleartext);
+                                    if (amt < cleartext.len) {
+                                        const rest = cleartext[amt..];
+                                        c.partial_cleartext_idx = 0;
+                                        c.partial_ciphertext_idx = @intCast(rest.len);
+                                        @memcpy(c.partially_read_buffer[0..rest.len], rest);
+                                    }
+                                }
+                            } else {
+                                // Output buffer was used directly which means no
+                                // memory copying needs to occur, and we can move
+                                // on to the next ciphertext record.
+                                self.read_state.vp.next(cleartext.len);
+                            }
+                        },
+                        else => {
+                            self.result = error.TlsUnexpectedMessage;
+                            self.state = .Done;
+                            return;
+                        },
+                    }
+                    in = end;
+                }
+            },
+            .Done => {},
+        }
+    }
+};
+
+pub const TlsRead = struct {
+    pub const State = enum { Init, SQE, CQE, Done };
+    pub const Result = E!usize;
+    pub const E = SQEError || error{TlsReadAdvanced};
+
+    client: i32,
+    tls_client: *std.crypto.tls.Client,
+    buffer: []u8,
+    read_state: *TlsReadState,
+
+    iovecs: []std.posix.iovec = undefined,
+    iovec_end: usize = undefined,
+    overhead_len: usize = undefined,
+    i: usize = 0,
+    total_amt: usize = 0,
+    off_i: usize = 0,
+    vec_i: usize = 0,
+    amt: usize = 0,
+
+    state: State = .Init,
+    result: Result = undefined,
+    scheduled: bool = false,
+    returned_from: PendingIndex = PendingIndex.empty(),
+    callback: PendingIndex = PendingIndex.empty(),
+
+    pub fn run(self: *@This(), loop: anytype) !void {
+        _ = loop;
+        const c = self.tls_client;
+        const buffer = self.buffer;
+        const len = 1;
+
+        outer: switch (self.state) {
+            .Init => {
+                self.read_state.iovecs = [1]std.posix.iovec{.{ .base = buffer.ptr, .len = buffer.len }};
+                self.iovecs = &self.read_state.iovecs;
+
+                if (c.eof()) {
+                    self.result = 0;
+                    self.state = .Done;
+                    return;
+                }
+                self.state = .SQE;
+                continue :outer .SQE;
+            },
+            .SQE => {
+                const stream: std.net.Stream = .{ .handle = self.client };
+                self.amt = c.readvAdvanced(stream, self.read_state.iovecs[self.vec_i..]) catch {
+                    self.result = error.TlsReadAdvanced;
+                    self.state = .Done;
+                    return;
+                };
+                self.state = .CQE;
+                continue :outer .CQE;
+            },
+            .CQE => {
+                self.off_i += self.amt;
+                if (c.eof() or self.off_i >= len) {
+                    self.result = self.off_i;
+                    self.state = .Done;
+                    return;
+                }
+                while (self.amt >= self.iovecs[self.vec_i].len) {
+                    self.amt -= self.iovecs[self.vec_i].len;
+                    self.vec_i += 1;
+                }
+                self.iovecs[self.vec_i].base += self.amt;
+                self.iovecs[self.vec_i].len -= self.amt;
+                self.state = .SQE;
+                continue :outer .SQE;
+            },
+            .Done => {},
+        }
+    }
+};
+
+// Returns the number of cleartext bytes sent, which may be fewer than `bytes.len`.
 pub const TlsWrite = struct {
     pub const State = enum { Init, SQE, CQE, Done };
     pub const Result = SQEError!usize;
@@ -656,13 +1188,17 @@ pub const TlsWrite = struct {
 };
 
 pub const ExampleSSLRequest = struct {
-    pub const State = enum { Connect, TlsInit, Write, Read, Done };
+    pub const State = enum { Connect, TlsInit, Write, Read, ReadCQE, Done };
     pub const Result = SQEError!void;
 
     client: i32,
     address: *std.net.Address,
     bundle: *std.crypto.Certificate.Bundle,
+
     tls_client: *std.crypto.tls.Client = undefined,
+    write_state: *TlsWriteState = undefined,
+    read_state: *TlsReadState = undefined,
+    tls_init: *vendored_tls.TlsInit = undefined,
 
     state: State = .Connect,
     result: Result = undefined,
@@ -674,6 +1210,10 @@ pub const ExampleSSLRequest = struct {
         switch (self.state) {
             .Connect => {
                 self.tls_client = &loop.context.tls_client;
+                self.write_state = &loop.context.tls_write_state;
+                self.read_state = &loop.context.tls_read_state;
+                self.tls_init = &loop.context.tls_init;
+
                 self.state = .TlsInit;
                 try loop.schedule_with_callback(Connect{
                     .payload = .{
@@ -695,7 +1235,7 @@ pub const ExampleSSLRequest = struct {
                 try loop.schedule_with_callback(TlsInit{
                     .client = self.client,
                     .host = "example.com",
-                    .tls_init = &loop.context.tls_init,
+                    .tls_init = self.tls_init,
                     .options = .{
                         .host = .{ .explicit = "example.com" },
                         .ca = .{ .bundle = self.bundle.* },
@@ -714,9 +1254,9 @@ pub const ExampleSSLRequest = struct {
                 self.state = .Read;
                 try loop.schedule_with_callback(TlsWrite{
                     .client = self.client,
-                    .tls_client = &loop.context.tls_client,
+                    .tls_client = self.tls_client,
                     .data = buffer_send,
-                    .write_state = &loop.context.tls_write_state,
+                    .write_state = self.write_state,
                 }, self);
             },
             .Read => {
@@ -726,12 +1266,21 @@ pub const ExampleSSLRequest = struct {
                     return;
                 };
 
-                const read_stream = ReadStream{ .client = self.client };
-                const read_size = self.tls_client.read(read_stream, loop.context.recv[0..]) catch |err| {
+                self.state = .ReadCQE;
+                try loop.schedule_with_callback(TlsRead{
+                    .client = self.client,
+                    .tls_client = self.tls_client,
+                    .buffer = loop.context.recv[0..],
+                    .read_state = self.read_state,
+                }, self);
+            },
+            .ReadCQE => {
+                const res = loop.result_for(TlsRead, self.returned_from) catch |err| {
                     std.debug.print("Read Err: {!}\n", .{err});
                     self.state = .Done;
                     return;
                 };
+                const read_size: usize = res;
                 const result = loop.context.recv[0..read_size];
                 std.debug.print("Read Success: {} {s}\n", .{ result.len, result[0..100] });
                 self.state = .Done;
@@ -813,7 +1362,7 @@ pub fn Loop(events: []const type, Context: type) type {
             if (i != index.tuple_index) {
                 std.debug.print("{} {}\n", .{ i, index });
             }
-            std.debug.assert(i == index.tuple_index);
+            assert(i == index.tuple_index);
             return self.pending.getByType(Event).get(index.pool_index).result;
         }
 
@@ -849,7 +1398,7 @@ pub fn Loop(events: []const type, Context: type) type {
                     // Assert for logical clarity, if-statement
                     // to allow the following setter to not
                     // be a compile error
-                    std.debug.assert(@TypeOf(event).Result == Result);
+                    assert(@TypeOf(event).Result == Result);
                     if (@TypeOf(event).Result != Result)
                         unreachable;
                     event.result = result;
@@ -1020,14 +1569,16 @@ pub fn main() !void {
         tls_client: std.crypto.tls.Client,
         tls_init: vendored_tls.TlsInit,
         tls_write_state: TlsWriteState,
+        tls_read_state: TlsReadState,
     };
 
-    var loop = try Loop(&[_]type{ LoopTimeout, WriteStdout, CQEResultPendingEvent, PollCompletions, Connect, Write, Read, ExampleSSLRequest, TlsInit, TlsWrite, WritevAll, Writev, ReadAtLeastOurAmtDecoder, ReadAtLeastDecoder, ReadAtLeast }, Context).init(std.heap.smp_allocator, .{
+    var loop = try Loop(&[_]type{ LoopTimeout, WriteStdout, CQEResultPendingEvent, PollCompletions, Connect, Write, Read, ExampleSSLRequest, TlsInit, TlsRead, TlsWrite, WritevAll, Writev, ReadAtLeastOurAmtDecoder, ReadAtLeastDecoder, ReadAtLeast }, Context).init(std.heap.smp_allocator, .{
         .ring = &ring.ring,
         .recv = undefined,
         .tls_client = undefined,
         .tls_init = undefined,
         .tls_write_state = undefined,
+        .tls_read_state = undefined,
     });
     defer loop.deinit();
 

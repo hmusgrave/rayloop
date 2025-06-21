@@ -7,9 +7,9 @@ const crypto = std.crypto;
 const assert = std.debug.assert;
 const Certificate = std.crypto.Certificate;
 
-const max_ciphertext_len = tls.max_ciphertext_len;
-const hmacExpandLabel = tls.hmacExpandLabel;
-const hkdfExpandLabel = tls.hkdfExpandLabel;
+pub const max_ciphertext_len = tls.max_ciphertext_len;
+pub const hmacExpandLabel = tls.hmacExpandLabel;
+pub const hkdfExpandLabel = tls.hkdfExpandLabel;
 const int = tls.int;
 const array = tls.array;
 
@@ -1646,7 +1646,7 @@ pub fn readvAdvanced(c: *Client, stream: anytype, iovecs: []const std.posix.iove
     }
 }
 
-fn logSecrets(key_log_file: std.fs.File, context: anytype, secrets: anytype) void {
+pub fn logSecrets(key_log_file: std.fs.File, context: anytype, secrets: anytype) void {
     const locked = if (key_log_file.lock(.exclusive)) |_| true else |_| false;
     defer if (locked) key_log_file.unlock();
     key_log_file.seekFromEnd(0) catch {};
@@ -1658,7 +1658,7 @@ fn logSecrets(key_log_file: std.fs.File, context: anytype, secrets: anytype) voi
     }) catch {};
 }
 
-fn finishRead(c: *Client, frag: []const u8, in: usize, out: usize) usize {
+pub fn finishRead(c: *Client, frag: []const u8, in: usize, out: usize) usize {
     const saved_buf = frag[in..];
     if (c.partial_ciphertext_idx > c.partial_cleartext_idx) {
         // There is cleartext at the beginning already which we need to preserve.
@@ -1674,7 +1674,7 @@ fn finishRead(c: *Client, frag: []const u8, in: usize, out: usize) usize {
 }
 
 /// Note that `first` usually overlaps with `c.partially_read_buffer`.
-fn finishRead2(c: *Client, first: []const u8, frag1: []const u8, out: usize) usize {
+pub fn finishRead2(c: *Client, first: []const u8, frag1: []const u8, out: usize) usize {
     if (c.partial_ciphertext_idx > c.partial_cleartext_idx) {
         // There is cleartext at the beginning already which we need to preserve.
         c.partial_ciphertext_end = @intCast(c.partial_ciphertext_idx + first.len + frag1.len);
@@ -1692,7 +1692,7 @@ fn finishRead2(c: *Client, first: []const u8, frag1: []const u8, out: usize) usi
     return out;
 }
 
-fn limitedOverlapCopy(frag: []u8, in: usize) void {
+pub fn limitedOverlapCopy(frag: []u8, in: usize) void {
     const first = frag[in..];
     if (first.len <= in) {
         // A single, non-overlapping memcpy suffices.
@@ -1703,7 +1703,7 @@ fn limitedOverlapCopy(frag: []u8, in: usize) void {
     }
 }
 
-fn straddleByte(s1: []const u8, s2: []const u8, index: usize) u8 {
+pub fn straddleByte(s1: []const u8, s2: []const u8, index: usize) u8 {
     if (index < s1.len) {
         return s1[index];
     } else {
@@ -1714,7 +1714,7 @@ fn straddleByte(s1: []const u8, s2: []const u8, index: usize) u8 {
 const builtin = @import("builtin");
 const native_endian = builtin.cpu.arch.endian();
 
-inline fn big(x: anytype) @TypeOf(x) {
+pub inline fn big(x: anytype) @TypeOf(x) {
     return switch (native_endian) {
         .big => x,
         .little => @byteSwap(x),
@@ -1975,7 +1975,7 @@ const CertificatePublicKey = struct {
 };
 
 /// Abstraction for sending multiple byte buffers to a slice of iovecs.
-const VecPut = struct {
+pub const VecPut = struct {
     iovecs: []const std.posix.iovec,
     idx: usize = 0,
     off: usize = 0,
@@ -2037,7 +2037,7 @@ const VecPut = struct {
 };
 
 /// Limit iovecs to a specific byte size.
-fn limitVecs(iovecs: []std.posix.iovec, len: usize) []std.posix.iovec {
+pub fn limitVecs(iovecs: []std.posix.iovec, len: usize) []std.posix.iovec {
     var bytes_left: usize = len;
     for (iovecs, 0..) |*iovec, vec_i| {
         if (bytes_left <= iovec.len) {
