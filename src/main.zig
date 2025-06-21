@@ -162,14 +162,34 @@ pub const SocketRead = IoUringSQE(SocketReadPayload, struct {
 //
 // Example SSL Request Workload
 //
+pub const ReadStream = struct {
+    pub const ReadError = error{};
+
+    client: i32,
+
+    pub fn readv(self: @This(), iovecs: []std.posix.iovec) ReadError!usize {
+        return std.os.linux.readv(self.client, iovecs.ptr, iovecs.len);
+    }
+};
+
+pub const WriteStream = struct {
+    pub const WriteError = error{};
+
+    client: i32,
+
+    pub fn writev(self: @This(), iovecs: []const std.posix.iovec_const) WriteError!usize {
+        return std.os.linux.writev(self.client, iovecs.ptr, iovecs.len);
+    }
+};
+
 pub const ExampleSSLRequest = struct {
-    pub const State = enum { Connect, Write, Read, Done };
+    pub const State = enum { Connect, Write, Done };
     pub const Result = CQEResult;
 
     client: i32,
     address: *std.net.Address,
     bundle: *std.crypto.Certificate.Bundle,
-    tls_client: std.crypto.tls.Client = undefined,
+    tls_client: *std.crypto.tls.Client = undefined,
 
     state: State = .Connect,
     result: Result = undefined,
@@ -180,6 +200,7 @@ pub const ExampleSSLRequest = struct {
     pub fn run(self: *@This(), loop: anytype) !void {
         switch (self.state) {
             .Connect => {
+                self.tls_client = &loop.context.tls_client;
                 self.state = .Write;
                 try loop.schedule_with_callback(Connect{
                     .payload = .{
@@ -206,44 +227,25 @@ pub const ExampleSSLRequest = struct {
                 while (true) {
                     switch (try foo.run(stream)) {
                         .Done => |client| {
-                            self.tls_client = client;
+                            self.tls_client.* = client;
                             break;
                         },
                         .Pending => {},
                     }
                 }
+                std.debug.print("TLS Initialized\n", .{});
 
                 const buffer_send = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
-                self.state = .Read;
-                try loop.schedule_with_callback(SocketWrite{
-                    .payload = .{
-                        .client = self.client,
-                        .data = buffer_send[0..],
-                    },
-                }, self);
-            },
-            .Read => {
-                // TODO: The API for `result_for` is incredibly error-prone
-                const res = loop.result_for(SocketWrite, self.returned_from);
-                switch (res.err()) {
-                    .SUCCESS => std.debug.print("Write Success\n", .{}),
-                    else => |err| std.debug.print("Write Err: {}\n", .{err}),
-                }
+                const write_stream = WriteStream{ .client = self.client };
+                _ = try self.tls_client.write(write_stream, buffer_send);
+
+                const read_stream = ReadStream{ .client = self.client };
+                const read_size = try self.tls_client.read(read_stream, loop.context.recv[0..]);
+                const result = loop.context.recv[0..read_size];
+                std.debug.print("Read Success: {} {s}\n", .{ result.len, result[0..100] });
                 self.state = .Done;
-                try loop.schedule_with_callback(SocketRead{
-                    .payload = .{
-                        .client = self.client,
-                        .buffer = loop.context.recv[0..],
-                    },
-                }, self);
             },
-            .Done => {
-                const res = loop.result_for(SocketRead, self.returned_from);
-                switch (res.err()) {
-                    .SUCCESS => std.debug.print("Read Success ({})\n\n{s}\n", .{ res.result, loop.context.recv[0..@intCast(res.result)] }),
-                    else => |err| std.debug.print("Read Err: {}\n", .{err}),
-                }
-            },
+            .Done => {},
         }
     }
 };
@@ -294,7 +296,6 @@ pub const ExampleRequest = struct {
                 }, self);
             },
             .Read => {
-                // TODO: The API for `result_for` is incredibly error-prone
                 const res = loop.result_for(SocketWrite, self.returned_from);
                 switch (res.err()) {
                     .SUCCESS => std.debug.print("Write Success\n", .{}),
@@ -387,6 +388,11 @@ pub fn Loop(events: []const type, Context: type) type {
         }
 
         pub fn result_for(self: *@This(), Event: type, index: PendingIndex) Event.Result {
+            const i = comptime @TypeOf(self.pending).getIndex(Event);
+            if (i != index.tuple_index) {
+                std.debug.print("{} {}\n", .{ i, index });
+            }
+            std.debug.assert(i == index.tuple_index);
             return self.pending.getByType(Event).get(index.pool_index).result;
         }
 
@@ -586,11 +592,13 @@ pub fn main() !void {
     const Context = struct {
         ring: *std.os.linux.IoUring,
         recv: [1024 * 64]u8,
+        tls_client: std.crypto.tls.Client,
     };
 
     var loop = try Loop(&[_]type{ Timeout, WriteStdout, CQEResultPendingEvent, PollCompletions, Connect, SocketWrite, SocketRead, ExampleRequest, ExampleSSLRequest }, Context).init(std.heap.smp_allocator, .{
         .ring = &ring.ring,
         .recv = undefined,
+        .tls_client = undefined,
     });
     defer loop.deinit();
 
