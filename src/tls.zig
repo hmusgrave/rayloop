@@ -1983,7 +1983,7 @@ pub const VecPut = struct {
 
     /// Returns the amount actually put which is always equal to bytes.len
     /// unless the vectors ran out of space.
-    fn put(vp: *VecPut, bytes: []const u8) usize {
+    pub fn put(vp: *VecPut, bytes: []const u8) usize {
         if (vp.idx >= vp.iovecs.len) return 0;
         var bytes_i: usize = 0;
         while (true) {
@@ -2009,7 +2009,7 @@ pub const VecPut = struct {
     }
 
     /// Returns the next buffer that consecutive bytes can go into.
-    fn peek(vp: VecPut) []u8 {
+    pub fn peek(vp: VecPut) []u8 {
         if (vp.idx >= vp.iovecs.len) return &.{};
         const v = vp.iovecs[vp.idx];
         return v.base[vp.off..v.len];
@@ -2017,7 +2017,7 @@ pub const VecPut = struct {
 
     // After writing to the result of peek(), one can call next() to
     // advance the cursor.
-    fn next(vp: *VecPut, len: usize) void {
+    pub fn next(vp: *VecPut, len: usize) void {
         vp.total += len;
         vp.off += len;
         if (vp.off >= vp.iovecs[vp.idx].len) {
@@ -2026,7 +2026,7 @@ pub const VecPut = struct {
         }
     }
 
-    fn freeSize(vp: VecPut) usize {
+    pub fn freeSize(vp: VecPut) usize {
         if (vp.idx >= vp.iovecs.len) return 0;
         var total: usize = 0;
         total += vp.iovecs[vp.idx].len - vp.off;

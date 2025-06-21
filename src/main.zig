@@ -584,7 +584,8 @@ pub const TlsReadState = struct {
 
 pub const TlsReadvAdvanced = struct {
     pub const State = enum { Init, CQE, Done };
-    pub const Result = SQEError!usize;
+    pub const Result = E!usize;
+    pub const E = SQEError || error{ TlsDecodeError, TlsConnectionTruncated, TlsRecordOverflow, TlsBadRecordMac, Overflow, TlsUnexpectedMessage, TlsBadLength, TlsIllegalParameter } || std.crypto.tls.AlertDescription.Error;
 
     client: i32,
     tls_client: *std.crypto.tls.Client,
@@ -592,7 +593,7 @@ pub const TlsReadvAdvanced = struct {
     read_state: *TlsReadState,
 
     vp: vendored_tls.VecPut = undefined,
-    first_iov: []const u8 = undefined,
+    first_iov: []u8 = undefined,
     iovec_end: usize = undefined,
     overhead_len: usize = undefined,
     i: usize = 0,
@@ -1055,7 +1056,6 @@ pub const TlsRead = struct {
     callback: PendingIndex = PendingIndex.empty(),
 
     pub fn run(self: *@This(), loop: anytype) !void {
-        _ = loop;
         const c = self.tls_client;
         const buffer = self.buffer;
         const len = 1;
@@ -1074,16 +1074,20 @@ pub const TlsRead = struct {
                 continue :outer .SQE;
             },
             .SQE => {
-                const stream: std.net.Stream = .{ .handle = self.client };
-                self.amt = c.readvAdvanced(stream, self.read_state.iovecs[self.vec_i..]) catch {
+                self.state = .CQE;
+                try loop.schedule_with_callback(TlsReadvAdvanced{
+                    .client = self.client,
+                    .tls_client = self.tls_client,
+                    .iovecs = self.iovecs[self.vec_i..],
+                    .read_state = self.read_state,
+                }, self);
+            },
+            .CQE => {
+                self.amt = loop.result_for(TlsReadvAdvanced, self.returned_from) catch {
                     self.result = error.TlsReadAdvanced;
                     self.state = .Done;
                     return;
                 };
-                self.state = .CQE;
-                continue :outer .CQE;
-            },
-            .CQE => {
                 self.off_i += self.amt;
                 if (c.eof() or self.off_i >= len) {
                     self.result = self.off_i;
@@ -1572,7 +1576,7 @@ pub fn main() !void {
         tls_read_state: TlsReadState,
     };
 
-    var loop = try Loop(&[_]type{ LoopTimeout, WriteStdout, CQEResultPendingEvent, PollCompletions, Connect, Write, Read, ExampleSSLRequest, TlsInit, TlsRead, TlsWrite, WritevAll, Writev, ReadAtLeastOurAmtDecoder, ReadAtLeastDecoder, ReadAtLeast }, Context).init(std.heap.smp_allocator, .{
+    var loop = try Loop(&[_]type{ LoopTimeout, WriteStdout, CQEResultPendingEvent, PollCompletions, Connect, Write, Read, ExampleSSLRequest, TlsInit, TlsRead, TlsReadvAdvanced, TlsWrite, WritevAll, Writev, ReadAtLeastOurAmtDecoder, ReadAtLeastDecoder, ReadAtLeast }, Context).init(std.heap.smp_allocator, .{
         .ring = &ring.ring,
         .recv = undefined,
         .tls_client = undefined,
