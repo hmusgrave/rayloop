@@ -158,6 +158,77 @@ pub const SocketRead = IoUringSQE(SocketReadPayload, struct {
 }._f);
 
 //
+// Example SSL Request Workload
+//
+pub const ExampleSSLRequest = struct {
+    pub const State = enum { Connect, Write, Read, Done };
+    pub const Result = CQEResult;
+
+    client: i32,
+    address: *std.net.Address,
+
+    state: State = .Connect,
+    result: Result = undefined,
+    scheduled: bool = false,
+    returned_from: PendingIndex = PendingIndex.empty(),
+    callback: PendingIndex = PendingIndex.empty(),
+
+    pub fn run(self: *@This(), loop: anytype) !void {
+        switch (self.state) {
+            .Connect => {
+                self.state = .Write;
+                try loop.schedule_with_callback(Connect{
+                    .payload = .{
+                        .client = self.client,
+                        .address = self.address,
+                    },
+                }, self);
+            },
+            .Write => {
+                const res = loop.result_for(Connect, self.returned_from);
+                switch (res.err()) {
+                    .SUCCESS => {
+                        std.debug.print("Connect Success\n", .{});
+                        try loop.schedule(WriteStdout{ .payload = "Connect Success (io_uring)\n" });
+                    },
+                    else => |err| std.debug.print("Connect Err: {}\n", .{err}),
+                }
+                const buffer_send = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+                self.state = .Read;
+                try loop.schedule_with_callback(SocketWrite{
+                    .payload = .{
+                        .client = self.client,
+                        .data = buffer_send[0..],
+                    },
+                }, self);
+            },
+            .Read => {
+                // TODO: The API for `result_for` is incredibly error-prone
+                const res = loop.result_for(SocketWrite, self.returned_from);
+                switch (res.err()) {
+                    .SUCCESS => std.debug.print("Write Success\n", .{}),
+                    else => |err| std.debug.print("Write Err: {}\n", .{err}),
+                }
+                self.state = .Done;
+                try loop.schedule_with_callback(SocketRead{
+                    .payload = .{
+                        .client = self.client,
+                        .buffer = loop.context.recv[0..],
+                    },
+                }, self);
+            },
+            .Done => {
+                const res = loop.result_for(SocketRead, self.returned_from);
+                switch (res.err()) {
+                    .SUCCESS => std.debug.print("Read Success ({})\n\n{s}\n", .{ res.result, loop.context.recv[0..@intCast(res.result)] }),
+                    else => |err| std.debug.print("Read Err: {}\n", .{err}),
+                }
+            },
+        }
+    }
+};
+
+//
 // Example Request Workload
 //
 pub const ExampleRequest = struct {
@@ -482,7 +553,7 @@ pub fn main() !void {
     try ring.setup(32);
     defer ring.deinit();
 
-    var address_list = try std.net.getAddressList(allocator, "example.com", 80);
+    var address_list = try std.net.getAddressList(allocator, "example.com", 443);
     defer address_list.deinit();
 
     if (address_list.addrs.len < 1)
@@ -504,7 +575,7 @@ pub fn main() !void {
     defer loop.deinit();
 
     try loop.schedule(Timeout.init(std.time.ns_per_s));
-    try loop.schedule(ExampleRequest{ .client = @intCast(client), .address = &address });
+    try loop.schedule(ExampleSSLRequest{ .client = @intCast(client), .address = &address });
     try loop.schedule(PollCompletions{});
     try loop.run();
 }
