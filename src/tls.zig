@@ -180,741 +180,767 @@ pub fn InitError(comptime Stream: type) type {
     };
 }
 
-pub const TlsInit = struct {
-    const State = enum { Init, Done };
-    state: State = .Init,
-
-    options: Options,
-
-    pub fn init(options: Options) @This() {
-        return .{ .options = options };
-    }
-    pub const MaybeClient = union(enum) {
-        Pending: void,
-        Done: Client,
-    };
-
-    pub fn run(self: *@This(), stream: anytype) InitError(@TypeOf(stream))!MaybeClient {
-        return .{ .Done = try orig_init(stream, self.options) };
-    }
-};
-
 /// Initiates a TLS handshake and establishes a TLSv1.2 or TLSv1.3 session with `stream`, which
 /// must conform to `StreamInterface`.
 ///
 /// `host` is only borrowed during this function call.
-pub fn orig_init(stream: anytype, options: Options) InitError(@TypeOf(stream))!Client {
-    const host = switch (options.host) {
-        .no_verification => "",
-        .explicit => |host| host,
-    };
-    const host_len: u16 = @intCast(host.len);
-
-    var random_buffer: [176]u8 = undefined;
-    crypto.random.bytes(&random_buffer);
-    const client_hello_rand = random_buffer[0..32].*;
-    var key_seq: u64 = 0;
-    var server_hello_rand: [32]u8 = undefined;
-    const legacy_session_id = random_buffer[32..64].*;
-
-    var key_share = KeyShare.init(random_buffer[64..176].*) catch |err| switch (err) {
-        // Only possible to happen if the seed is all zeroes.
-        error.IdentityElement => return error.InsufficientEntropy,
+pub const TlsInit = struct {
+    pub const Result = union(enum) {
+        done: Client,
+        action: union(enum) {
+            writevAll: []std.posix.iovec_const,
+            decoder: union(enum) {
+                readAtLeastOurAmt: struct { decoder: *tls.Decoder, our_amt: usize },
+                readAtLeast: struct { decoder: *tls.Decoder, their_amt: usize },
+            },
+        },
     };
 
-    const extensions_payload = tls.extension(.supported_versions, array(u8, tls.ProtocolVersion, .{
-        .tls_1_3,
-        .tls_1_2,
-    })) ++ tls.extension(.signature_algorithms, array(u16, tls.SignatureScheme, .{
-        .ecdsa_secp256r1_sha256,
-        .ecdsa_secp384r1_sha384,
-        .rsa_pkcs1_sha256,
-        .rsa_pkcs1_sha384,
-        .rsa_pkcs1_sha512,
-        .rsa_pss_rsae_sha256,
-        .rsa_pss_rsae_sha384,
-        .rsa_pss_rsae_sha512,
-        .rsa_pss_pss_sha256,
-        .rsa_pss_pss_sha384,
-        .rsa_pss_pss_sha512,
-        .rsa_pkcs1_sha1,
-        .ed25519,
-    })) ++ tls.extension(.supported_groups, array(u16, tls.NamedGroup, .{
-        .x25519_ml_kem768,
-        .secp256r1,
-        .secp384r1,
-        .x25519,
-    })) ++ tls.extension(.psk_key_exchange_modes, array(u8, tls.PskKeyExchangeMode, .{
-        .psk_dhe_ke,
-    })) ++ tls.extension(.key_share, array(
-        u16,
-        u8,
-        int(u16, @intFromEnum(tls.NamedGroup.x25519_ml_kem768)) ++
-            array(u16, u8, key_share.ml_kem768_kp.public_key.toBytes() ++ key_share.x25519_kp.public_key) ++
-            int(u16, @intFromEnum(tls.NamedGroup.secp256r1)) ++
-            array(u16, u8, key_share.secp256r1_kp.public_key.toUncompressedSec1()) ++
-            int(u16, @intFromEnum(tls.NamedGroup.secp384r1)) ++
-            array(u16, u8, key_share.secp384r1_kp.public_key.toUncompressedSec1()) ++
-            int(u16, @intFromEnum(tls.NamedGroup.x25519)) ++
-            array(u16, u8, key_share.x25519_kp.public_key),
-    ));
-    const server_name_extension = int(u16, @intFromEnum(tls.ExtensionType.server_name)) ++
-        int(u16, 2 + 1 + 2 + host_len) ++ // byte length of this extension payload
-        int(u16, 1 + 2 + host_len) ++ // server_name_list byte count
-        .{0x00} ++ // name_type
-        int(u16, host_len);
-    const server_name_extension_len = switch (options.host) {
-        .no_verification => 0,
-        .explicit => server_name_extension.len + host_len,
-    };
-
-    const extensions_header =
-        int(u16, @intCast(extensions_payload.len + server_name_extension_len)) ++
-        extensions_payload ++
-        server_name_extension;
-
-    const client_hello =
-        int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
-        client_hello_rand ++
-        [1]u8{32} ++ legacy_session_id ++
-        cipher_suites ++
-        array(u8, tls.CompressionMethod, .{.null}) ++
-        extensions_header;
-
-    const out_handshake = .{@intFromEnum(tls.HandshakeType.client_hello)} ++
-        int(u24, @intCast(client_hello.len - server_name_extension.len + server_name_extension_len)) ++
-        client_hello;
-
-    const cleartext_header_buf = .{@intFromEnum(tls.ContentType.handshake)} ++
-        int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_0)) ++
-        int(u16, @intCast(out_handshake.len - server_name_extension.len + server_name_extension_len)) ++
-        out_handshake;
-    const cleartext_header = switch (options.host) {
-        .no_verification => cleartext_header_buf[0 .. cleartext_header_buf.len - server_name_extension.len],
-        .explicit => &cleartext_header_buf,
-    };
-
-    {
-        var iovecs = [_]std.posix.iovec_const{
-            .{ .base = cleartext_header.ptr, .len = cleartext_header.len },
-            .{ .base = host.ptr, .len = host.len },
+    pub fn RunArg(E: type) type {
+        return union {
+            options: Options,
+            stream: union {
+                writevAll: E!void,
+                decoder: union {
+                    readAtLeastOurAmt: E!void,
+                    readAtLeast: E!void,
+                },
+            },
         };
-        try stream.writevAll(iovecs[0..if (host.len == 0) 1 else 2]);
     }
 
-    var tls_version: tls.ProtocolVersion = undefined;
-    // These are used for two purposes:
-    // * Detect whether a certificate is the first one presented, in which case
-    //   we need to verify the host name.
-    var cert_index: usize = 0;
-    // * Flip back and forth between the two cleartext buffers in order to keep
-    //   the previous certificate in memory so that it can be verified by the
-    //   next one.
-    var cert_buf_index: usize = 0;
-    var write_seq: u64 = 0;
-    var read_seq: u64 = 0;
-    var prev_cert: Certificate.Parsed = undefined;
-    const CipherState = enum {
-        /// No cipher is in use
-        cleartext,
-        /// Handshake cipher is in use
-        handshake,
-        /// Application cipher is in use
-        application,
-    };
-    var pending_cipher_state: CipherState = .cleartext;
-    var cipher_state = pending_cipher_state;
-    const HandshakeState = enum {
-        /// In this state we expect only a server hello message.
-        hello,
-        /// In this state we expect only an encrypted_extensions message.
-        encrypted_extensions,
-        /// In this state we expect certificate handshake messages.
-        certificate,
-        /// In this state we expect certificate or certificate_verify messages.
-        /// certificate messages are ignored since the trust chain is already
-        /// established.
-        trust_chain_established,
-        /// In this state, we expect only the server_hello_done handshake message.
-        server_hello_done,
-        /// In this state, we expect only the finished handshake message.
-        finished,
-    };
-    var handshake_state: HandshakeState = .hello;
-    var handshake_cipher: tls.HandshakeCipher = undefined;
-    var main_cert_pub_key: CertificatePublicKey = undefined;
-    const now_sec = std.time.timestamp();
+    pub const State = enum { CleartextHeader, Remainder, Done };
+    state: State = .CleartextHeader,
 
-    var cleartext_fragment_start: usize = 0;
-    var cleartext_fragment_end: usize = 0;
-    var cleartext_bufs: [2][tls.max_ciphertext_inner_record_len]u8 = undefined;
-    var handshake_buffer: [tls.max_ciphertext_record_len]u8 = undefined;
-    var d: tls.Decoder = .{ .buf = &handshake_buffer };
-    fragment: while (true) {
-        try d.readAtLeastOurAmt(stream, tls.record_header_len);
-        const record_header = d.buf[d.idx..][0..tls.record_header_len];
-        const record_ct = d.decode(tls.ContentType);
-        d.skip(2); // legacy_version
-        const record_len = d.decode(u16);
-        try d.readAtLeast(stream, record_len);
-        var record_decoder = try d.sub(record_len);
-        var ctd, const ct = content: switch (cipher_state) {
-            .cleartext => .{ record_decoder, record_ct },
-            .handshake => {
-                std.debug.assert(tls_version == .tls_1_3);
-                if (record_ct != .application_data) return error.TlsUnexpectedMessage;
-                try record_decoder.ensure(record_len);
-                const cleartext_buf = &cleartext_bufs[cert_buf_index % 2];
-                switch (handshake_cipher) {
-                    inline else => |*p| {
-                        const pv = &p.version.tls_1_3;
-                        const P = @TypeOf(p.*).A;
-                        if (record_len < P.AEAD.tag_length) return error.TlsRecordOverflow;
-                        const ciphertext = record_decoder.slice(record_len - P.AEAD.tag_length);
-                        const cleartext_fragment_buf = cleartext_buf[cleartext_fragment_end..];
-                        if (ciphertext.len > cleartext_fragment_buf.len) return error.TlsRecordOverflow;
-                        const cleartext = cleartext_fragment_buf[0..ciphertext.len];
-                        const auth_tag = record_decoder.array(P.AEAD.tag_length).*;
-                        const nonce = nonce: {
-                            const V = @Vector(P.AEAD.nonce_length, u8);
-                            const pad = [1]u8{0} ** (P.AEAD.nonce_length - 8);
-                            const operand: V = pad ++ @as([8]u8, @bitCast(big(read_seq)));
-                            break :nonce @as(V, pv.server_handshake_iv) ^ operand;
-                        };
-                        P.AEAD.decrypt(cleartext, ciphertext, auth_tag, record_header, nonce, pv.server_handshake_key) catch
-                            return error.TlsBadRecordMac;
-                        cleartext_fragment_end += std.mem.trimEnd(u8, cleartext, "\x00").len;
-                    },
-                }
-                read_seq += 1;
-                cleartext_fragment_end -= 1;
-                const ct: tls.ContentType = @enumFromInt(cleartext_buf[cleartext_fragment_end]);
-                if (ct != .handshake) return error.TlsUnexpectedMessage;
-                break :content .{ tls.Decoder.fromTheirSlice(@constCast(cleartext_buf[cleartext_fragment_start..cleartext_fragment_end])), ct };
+    options: Options = undefined,
+    host: []const u8 = undefined,
+    key_seq: u64 = 0,
+    client_hello_rand: [32]u8 = undefined,
+    server_hello_rand: [32]u8 = undefined,
+    random_buffer: [176]u8 = undefined,
+    legacy_session_id: [32]u8 = undefined,
+    key_share: KeyShare = undefined,
+    cleartext_header_buf: [1600]u8 = undefined,
+    cleartext_header: []const u8 = undefined,
+
+    pub fn run(self: *@This(), stream: anytype, E: type, arg: RunArg(E)) InitError(@TypeOf(stream))!Result {
+        switch (self.state) {
+            .CleartextHeader => {
+                self.options = arg.options;
+                self.host = switch (self.options.host) {
+                    .no_verification => "",
+                    .explicit => |host| host,
+                };
+                const host_len: u16 = @intCast(self.host.len);
+
+                crypto.random.bytes(&self.random_buffer);
+                self.client_hello_rand = self.random_buffer[0..32].*;
+                self.legacy_session_id = self.random_buffer[32..64].*;
+
+                self.key_share = KeyShare.init(self.random_buffer[64..176].*) catch |err| switch (err) {
+                    // Only possible to happen if the seed is all zeroes.
+                    error.IdentityElement => return error.InsufficientEntropy,
+                };
+
+                const extensions_payload = tls.extension(.supported_versions, array(u8, tls.ProtocolVersion, .{
+                    .tls_1_3,
+                    .tls_1_2,
+                })) ++ tls.extension(.signature_algorithms, array(u16, tls.SignatureScheme, .{
+                    .ecdsa_secp256r1_sha256,
+                    .ecdsa_secp384r1_sha384,
+                    .rsa_pkcs1_sha256,
+                    .rsa_pkcs1_sha384,
+                    .rsa_pkcs1_sha512,
+                    .rsa_pss_rsae_sha256,
+                    .rsa_pss_rsae_sha384,
+                    .rsa_pss_rsae_sha512,
+                    .rsa_pss_pss_sha256,
+                    .rsa_pss_pss_sha384,
+                    .rsa_pss_pss_sha512,
+                    .rsa_pkcs1_sha1,
+                    .ed25519,
+                })) ++ tls.extension(.supported_groups, array(u16, tls.NamedGroup, .{
+                    .x25519_ml_kem768,
+                    .secp256r1,
+                    .secp384r1,
+                    .x25519,
+                })) ++ tls.extension(.psk_key_exchange_modes, array(u8, tls.PskKeyExchangeMode, .{
+                    .psk_dhe_ke,
+                })) ++ tls.extension(.key_share, array(
+                    u16,
+                    u8,
+                    int(u16, @intFromEnum(tls.NamedGroup.x25519_ml_kem768)) ++
+                        array(u16, u8, self.key_share.ml_kem768_kp.public_key.toBytes() ++ self.key_share.x25519_kp.public_key) ++
+                        int(u16, @intFromEnum(tls.NamedGroup.secp256r1)) ++
+                        array(u16, u8, self.key_share.secp256r1_kp.public_key.toUncompressedSec1()) ++
+                        int(u16, @intFromEnum(tls.NamedGroup.secp384r1)) ++
+                        array(u16, u8, self.key_share.secp384r1_kp.public_key.toUncompressedSec1()) ++
+                        int(u16, @intFromEnum(tls.NamedGroup.x25519)) ++
+                        array(u16, u8, self.key_share.x25519_kp.public_key),
+                ));
+                const server_name_extension = int(u16, @intFromEnum(tls.ExtensionType.server_name)) ++
+                    int(u16, 2 + 1 + 2 + host_len) ++ // byte length of this extension payload
+                    int(u16, 1 + 2 + host_len) ++ // server_name_list byte count
+                    .{0x00} ++ // name_type
+                    int(u16, host_len);
+                const server_name_extension_len = switch (self.options.host) {
+                    .no_verification => 0,
+                    .explicit => server_name_extension.len + host_len,
+                };
+
+                const extensions_header =
+                    int(u16, @intCast(extensions_payload.len + server_name_extension_len)) ++
+                    extensions_payload ++
+                    server_name_extension;
+
+                const client_hello =
+                    int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
+                    self.client_hello_rand ++
+                    [1]u8{32} ++ self.legacy_session_id ++
+                    cipher_suites ++
+                    array(u8, tls.CompressionMethod, .{.null}) ++
+                    extensions_header;
+
+                const out_handshake = .{@intFromEnum(tls.HandshakeType.client_hello)} ++
+                    int(u24, @intCast(client_hello.len - server_name_extension.len + server_name_extension_len)) ++
+                    client_hello;
+
+                self.cleartext_header_buf = .{@intFromEnum(tls.ContentType.handshake)} ++
+                    int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_0)) ++
+                    int(u16, @intCast(out_handshake.len - server_name_extension.len + server_name_extension_len)) ++
+                    out_handshake;
+                self.cleartext_header = switch (self.options.host) {
+                    .no_verification => self.cleartext_header_buf[0 .. self.cleartext_header_buf.len - server_name_extension.len],
+                    .explicit => &self.cleartext_header_buf,
+                };
+
+                var iovecs = [_]std.posix.iovec_const{
+                    .{ .base = self.cleartext_header.ptr, .len = self.cleartext_header.len },
+                    .{ .base = self.host.ptr, .len = self.host.len },
+                };
+                self.state = .Remainder;
+                return .{ .action = .{ .writevAll = iovecs[0..if (self.host.len == 0) 1 else 2] } };
             },
-            .application => {
-                std.debug.assert(tls_version == .tls_1_2);
-                if (record_ct != .handshake) return error.TlsUnexpectedMessage;
-                try record_decoder.ensure(record_len);
-                const cleartext_buf = &cleartext_bufs[cert_buf_index % 2];
-                switch (handshake_cipher) {
-                    inline else => |*p| {
-                        const pv = &p.version.tls_1_2;
-                        const P = @TypeOf(p.*).A;
-                        if (record_len < P.record_iv_length + P.mac_length) return error.TlsRecordOverflow;
-                        const message_len: u16 = record_len - P.record_iv_length - P.mac_length;
-                        const cleartext_fragment_buf = cleartext_buf[cleartext_fragment_end..];
-                        if (message_len > cleartext_fragment_buf.len) return error.TlsRecordOverflow;
-                        const cleartext = cleartext_fragment_buf[0..message_len];
-                        const ad = std.mem.toBytes(big(read_seq)) ++
-                            record_header[0 .. 1 + 2] ++
-                            std.mem.toBytes(big(message_len));
-                        const record_iv = record_decoder.array(P.record_iv_length).*;
-                        const masked_read_seq = read_seq &
-                            comptime std.math.shl(u64, std.math.maxInt(u64), 8 * P.record_iv_length);
-                        const nonce: [P.AEAD.nonce_length]u8 = nonce: {
-                            const V = @Vector(P.AEAD.nonce_length, u8);
-                            const pad = [1]u8{0} ** (P.AEAD.nonce_length - 8);
-                            const operand: V = pad ++ @as([8]u8, @bitCast(big(masked_read_seq)));
-                            break :nonce @as(V, pv.app_cipher.server_write_IV ++ record_iv) ^ operand;
-                        };
-                        const ciphertext = record_decoder.slice(message_len);
-                        const auth_tag = record_decoder.array(P.mac_length);
-                        P.AEAD.decrypt(cleartext, ciphertext, auth_tag.*, ad, nonce, pv.app_cipher.server_write_key) catch return error.TlsBadRecordMac;
-                        cleartext_fragment_end += message_len;
-                    },
-                }
-                read_seq += 1;
-                break :content .{ tls.Decoder.fromTheirSlice(cleartext_buf[cleartext_fragment_start..cleartext_fragment_end]), record_ct };
-            },
-        };
-        switch (ct) {
-            .alert => {
-                ctd.ensure(2) catch continue :fragment;
-                const level = ctd.decode(tls.AlertLevel);
-                const desc = ctd.decode(tls.AlertDescription);
-                _ = level;
+            .Remainder => {
+                try arg.stream.writevAll;
+                var tls_version: tls.ProtocolVersion = undefined;
+                // These are used for two purposes:
+                // * Detect whether a certificate is the first one presented, in which case
+                //   we need to verify the host name.
+                var cert_index: usize = 0;
+                // * Flip back and forth between the two cleartext buffers in order to keep
+                //   the previous certificate in memory so that it can be verified by the
+                //   next one.
+                var cert_buf_index: usize = 0;
+                var write_seq: u64 = 0;
+                var read_seq: u64 = 0;
+                var prev_cert: Certificate.Parsed = undefined;
+                const CipherState = enum {
+                    /// No cipher is in use
+                    cleartext,
+                    /// Handshake cipher is in use
+                    handshake,
+                    /// Application cipher is in use
+                    application,
+                };
+                var pending_cipher_state: CipherState = .cleartext;
+                var cipher_state = pending_cipher_state;
+                const HandshakeState = enum {
+                    /// In this state we expect only a server hello message.
+                    hello,
+                    /// In this state we expect only an encrypted_extensions message.
+                    encrypted_extensions,
+                    /// In this state we expect certificate handshake messages.
+                    certificate,
+                    /// In this state we expect certificate or certificate_verify messages.
+                    /// certificate messages are ignored since the trust chain is already
+                    /// established.
+                    trust_chain_established,
+                    /// In this state, we expect only the server_hello_done handshake message.
+                    server_hello_done,
+                    /// In this state, we expect only the finished handshake message.
+                    finished,
+                };
+                var handshake_state: HandshakeState = .hello;
+                var handshake_cipher: tls.HandshakeCipher = undefined;
+                var main_cert_pub_key: CertificatePublicKey = undefined;
+                const now_sec = std.time.timestamp();
 
-                // if this isn't a error alert, then it's a closure alert, which makes no sense in a handshake
-                try desc.toError();
-                // TODO: handle server-side closures
-                return error.TlsUnexpectedMessage;
-            },
-            .change_cipher_spec => {
-                ctd.ensure(1) catch continue :fragment;
-                if (ctd.decode(tls.ChangeCipherSpecType) != .change_cipher_spec) return error.TlsIllegalParameter;
-                cipher_state = pending_cipher_state;
-            },
-            .handshake => while (true) {
-                ctd.ensure(4) catch continue :fragment;
-                const handshake_type = ctd.decode(tls.HandshakeType);
-                const handshake_len = ctd.decode(u24);
-                var hsd = ctd.sub(handshake_len) catch continue :fragment;
-                const wrapped_handshake = ctd.buf[ctd.idx - handshake_len - 4 .. ctd.idx];
-                switch (handshake_type) {
-                    .server_hello => {
-                        if (cipher_state != .cleartext) return error.TlsUnexpectedMessage;
-                        if (handshake_state != .hello) return error.TlsUnexpectedMessage;
-                        try hsd.ensure(2 + 32 + 1);
-                        const legacy_version = hsd.decode(u16);
-                        @memcpy(&server_hello_rand, hsd.array(32));
-                        if (mem.eql(u8, &server_hello_rand, &tls.hello_retry_request_sequence)) {
-                            // This is a HelloRetryRequest message. This client implementation
-                            // does not expect to get one.
-                            return error.TlsUnexpectedMessage;
-                        }
-                        const legacy_session_id_echo_len = hsd.decode(u8);
-                        try hsd.ensure(legacy_session_id_echo_len + 2 + 1);
-                        const legacy_session_id_echo = hsd.slice(legacy_session_id_echo_len);
-                        const cipher_suite_tag = hsd.decode(tls.CipherSuite);
-                        hsd.skip(1); // legacy_compression_method
-                        var supported_version: ?u16 = null;
-                        if (!hsd.eof()) {
-                            try hsd.ensure(2);
-                            const extensions_size = hsd.decode(u16);
-                            var all_extd = try hsd.sub(extensions_size);
-                            while (!all_extd.eof()) {
-                                try all_extd.ensure(2 + 2);
-                                const et = all_extd.decode(tls.ExtensionType);
-                                const ext_size = all_extd.decode(u16);
-                                var extd = try all_extd.sub(ext_size);
-                                switch (et) {
-                                    .supported_versions => {
-                                        if (supported_version) |_| return error.TlsIllegalParameter;
-                                        try extd.ensure(2);
-                                        supported_version = extd.decode(u16);
-                                    },
-                                    .key_share => {
-                                        if (key_share.getSharedSecret()) |_| return error.TlsIllegalParameter;
-                                        try extd.ensure(4);
-                                        const named_group = extd.decode(tls.NamedGroup);
-                                        const key_size = extd.decode(u16);
-                                        try extd.ensure(key_size);
-                                        try key_share.exchange(named_group, extd.slice(key_size));
-                                    },
-                                    else => {},
-                                }
-                            }
-                        }
-
-                        tls_version = @enumFromInt(supported_version orelse legacy_version);
-                        switch (tls_version) {
-                            .tls_1_3 => if (!mem.eql(u8, legacy_session_id_echo, &legacy_session_id)) return error.TlsIllegalParameter,
-                            .tls_1_2 => if (mem.eql(u8, server_hello_rand[24..31], "DOWNGRD") and
-                                server_hello_rand[31] >> 1 == 0x00) return error.TlsIllegalParameter,
-                            else => return error.TlsIllegalParameter,
-                        }
-
-                        switch (cipher_suite_tag) {
-                            inline .AES_128_GCM_SHA256,
-                            .AES_256_GCM_SHA384,
-                            .CHACHA20_POLY1305_SHA256,
-                            .AEGIS_256_SHA512,
-                            .AEGIS_128L_SHA256,
-
-                            .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-                            .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-                            .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-                            => |tag| {
-                                handshake_cipher = @unionInit(tls.HandshakeCipher, @tagName(tag.with()), .{
-                                    .transcript_hash = .init(.{}),
-                                    .version = undefined,
-                                });
-                                const p = &@field(handshake_cipher, @tagName(tag.with()));
-                                p.transcript_hash.update(cleartext_header[tls.record_header_len..]); // Client Hello part 1
-                                p.transcript_hash.update(host); // Client Hello part 2
-                                p.transcript_hash.update(wrapped_handshake);
-                            },
-
-                            else => return error.TlsIllegalParameter,
-                        }
-                        switch (tls_version) {
-                            .tls_1_3 => {
-                                switch (cipher_suite_tag) {
-                                    inline .AES_128_GCM_SHA256,
-                                    .AES_256_GCM_SHA384,
-                                    .CHACHA20_POLY1305_SHA256,
-                                    .AEGIS_256_SHA512,
-                                    .AEGIS_128L_SHA256,
-                                    => |tag| {
-                                        const sk = key_share.getSharedSecret() orelse return error.TlsIllegalParameter;
-                                        const p = &@field(handshake_cipher, @tagName(tag.with()));
-                                        const P = @TypeOf(p.*).A;
-                                        const hello_hash = p.transcript_hash.peek();
-                                        const zeroes = [1]u8{0} ** P.Hash.digest_length;
-                                        const early_secret = P.Hkdf.extract(&[1]u8{0}, &zeroes);
-                                        const empty_hash = tls.emptyHash(P.Hash);
-                                        p.version = .{ .tls_1_3 = undefined };
-                                        const pv = &p.version.tls_1_3;
-                                        const hs_derived_secret = hkdfExpandLabel(P.Hkdf, early_secret, "derived", &empty_hash, P.Hash.digest_length);
-                                        pv.handshake_secret = P.Hkdf.extract(&hs_derived_secret, sk);
-                                        const ap_derived_secret = hkdfExpandLabel(P.Hkdf, pv.handshake_secret, "derived", &empty_hash, P.Hash.digest_length);
-                                        pv.master_secret = P.Hkdf.extract(&ap_derived_secret, &zeroes);
-                                        const client_secret = hkdfExpandLabel(P.Hkdf, pv.handshake_secret, "c hs traffic", &hello_hash, P.Hash.digest_length);
-                                        const server_secret = hkdfExpandLabel(P.Hkdf, pv.handshake_secret, "s hs traffic", &hello_hash, P.Hash.digest_length);
-                                        if (options.ssl_key_log_file) |key_log_file| logSecrets(key_log_file, .{
-                                            .client_random = &client_hello_rand,
-                                        }, .{
-                                            .SERVER_HANDSHAKE_TRAFFIC_SECRET = &server_secret,
-                                            .CLIENT_HANDSHAKE_TRAFFIC_SECRET = &client_secret,
-                                        });
-                                        pv.client_finished_key = hkdfExpandLabel(P.Hkdf, client_secret, "finished", "", P.Hmac.key_length);
-                                        pv.server_finished_key = hkdfExpandLabel(P.Hkdf, server_secret, "finished", "", P.Hmac.key_length);
-                                        pv.client_handshake_key = hkdfExpandLabel(P.Hkdf, client_secret, "key", "", P.AEAD.key_length);
-                                        pv.server_handshake_key = hkdfExpandLabel(P.Hkdf, server_secret, "key", "", P.AEAD.key_length);
-                                        pv.client_handshake_iv = hkdfExpandLabel(P.Hkdf, client_secret, "iv", "", P.AEAD.nonce_length);
-                                        pv.server_handshake_iv = hkdfExpandLabel(P.Hkdf, server_secret, "iv", "", P.AEAD.nonce_length);
-                                    },
-                                    else => return error.TlsIllegalParameter,
-                                }
-                                pending_cipher_state = .handshake;
-                                handshake_state = .encrypted_extensions;
-                            },
-                            .tls_1_2 => switch (cipher_suite_tag) {
-                                .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-                                .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-                                .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-                                => handshake_state = .certificate,
-                                else => return error.TlsIllegalParameter,
-                            },
-                            else => return error.TlsIllegalParameter,
-                        }
-                    },
-                    .encrypted_extensions => {
-                        if (tls_version != .tls_1_3) return error.TlsUnexpectedMessage;
-                        if (cipher_state != .handshake) return error.TlsUnexpectedMessage;
-                        if (handshake_state != .encrypted_extensions) return error.TlsUnexpectedMessage;
-                        switch (handshake_cipher) {
-                            inline else => |*p| p.transcript_hash.update(wrapped_handshake),
-                        }
-                        try hsd.ensure(2);
-                        const total_ext_size = hsd.decode(u16);
-                        var all_extd = try hsd.sub(total_ext_size);
-                        while (!all_extd.eof()) {
-                            try all_extd.ensure(4);
-                            const et = all_extd.decode(tls.ExtensionType);
-                            const ext_size = all_extd.decode(u16);
-                            const extd = try all_extd.sub(ext_size);
-                            _ = extd;
-                            switch (et) {
-                                .server_name => {},
-                                else => {},
-                            }
-                        }
-                        handshake_state = .certificate;
-                    },
-                    .certificate => cert: {
-                        if (cipher_state == .application) return error.TlsUnexpectedMessage;
-                        switch (handshake_state) {
-                            .certificate => {},
-                            .trust_chain_established => break :cert,
-                            else => return error.TlsUnexpectedMessage,
-                        }
-                        switch (handshake_cipher) {
-                            inline else => |*p| p.transcript_hash.update(wrapped_handshake),
-                        }
-
-                        switch (tls_version) {
-                            .tls_1_3 => {
-                                try hsd.ensure(1 + 3);
-                                const cert_req_ctx_len = hsd.decode(u8);
-                                if (cert_req_ctx_len != 0) return error.TlsIllegalParameter;
-                            },
-                            .tls_1_2 => try hsd.ensure(3),
-                            else => unreachable,
-                        }
-                        const certs_size = hsd.decode(u24);
-                        var certs_decoder = try hsd.sub(certs_size);
-                        while (!certs_decoder.eof()) {
-                            try certs_decoder.ensure(3);
-                            const cert_size = certs_decoder.decode(u24);
-                            const certd = try certs_decoder.sub(cert_size);
-
-                            if (tls_version == .tls_1_3) {
-                                try certs_decoder.ensure(2);
-                                const total_ext_size = certs_decoder.decode(u16);
-                                const all_extd = try certs_decoder.sub(total_ext_size);
-                                _ = all_extd;
-                            }
-
-                            const subject_cert: Certificate = .{
-                                .buffer = certd.buf,
-                                .index = @intCast(certd.idx),
-                            };
-                            const subject = try subject_cert.parse();
-                            if (cert_index == 0) {
-                                // Verify the host on the first certificate.
-                                switch (options.host) {
-                                    .no_verification => {},
-                                    .explicit => try subject.verifyHostName(host),
-                                }
-
-                                // Keep track of the public key for the
-                                // certificate_verify message later.
-                                try main_cert_pub_key.init(subject.pub_key_algo, subject.pubKey());
-                            } else {
-                                try prev_cert.verify(subject, now_sec);
-                            }
-
-                            switch (options.ca) {
-                                .no_verification => {
-                                    handshake_state = .trust_chain_established;
-                                    break :cert;
-                                },
-                                .self_signed => {
-                                    try subject.verify(subject, now_sec);
-                                    handshake_state = .trust_chain_established;
-                                    break :cert;
-                                },
-                                .bundle => |ca_bundle| if (ca_bundle.verify(subject, now_sec)) |_| {
-                                    handshake_state = .trust_chain_established;
-                                    break :cert;
-                                } else |err| switch (err) {
-                                    error.CertificateIssuerNotFound => {},
-                                    else => |e| return e,
-                                },
-                            }
-
-                            prev_cert = subject;
-                            cert_index += 1;
-                        }
-                        cert_buf_index += 1;
-                    },
-                    .server_key_exchange => {
-                        if (tls_version != .tls_1_2) return error.TlsUnexpectedMessage;
-                        if (cipher_state != .cleartext) return error.TlsUnexpectedMessage;
-                        switch (handshake_state) {
-                            .trust_chain_established => {},
-                            .certificate => return error.TlsCertificateNotVerified,
-                            else => return error.TlsUnexpectedMessage,
-                        }
-
-                        switch (handshake_cipher) {
-                            inline else => |*p| p.transcript_hash.update(wrapped_handshake),
-                        }
-                        try hsd.ensure(1 + 2 + 1);
-                        const curve_type = hsd.decode(u8);
-                        if (curve_type != 0x03) return error.TlsIllegalParameter; // named_curve
-                        const named_group = hsd.decode(tls.NamedGroup);
-                        const key_size = hsd.decode(u8);
-                        try hsd.ensure(key_size);
-                        const server_pub_key = hsd.slice(key_size);
-                        try main_cert_pub_key.verifySignature(&hsd, &.{ &client_hello_rand, &server_hello_rand, hsd.buf[0..hsd.idx] });
-                        try key_share.exchange(named_group, server_pub_key);
-                        handshake_state = .server_hello_done;
-                    },
-                    .server_hello_done => {
-                        if (tls_version != .tls_1_2) return error.TlsUnexpectedMessage;
-                        if (cipher_state != .cleartext) return error.TlsUnexpectedMessage;
-                        if (handshake_state != .server_hello_done) return error.TlsUnexpectedMessage;
-
-                        const client_key_exchange_msg = .{@intFromEnum(tls.ContentType.handshake)} ++
-                            int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
-                            array(u16, u8, .{@intFromEnum(tls.HandshakeType.client_key_exchange)} ++
-                                array(u24, u8, array(u8, u8, key_share.secp256r1_kp.public_key.toUncompressedSec1())));
-                        const client_change_cipher_spec_msg = .{@intFromEnum(tls.ContentType.change_cipher_spec)} ++
-                            int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
-                            array(u16, tls.ChangeCipherSpecType, .{.change_cipher_spec});
-                        const pre_master_secret = key_share.getSharedSecret().?;
-                        switch (handshake_cipher) {
-                            inline else => |*p| {
-                                const P = @TypeOf(p.*).A;
-                                p.transcript_hash.update(wrapped_handshake);
-                                p.transcript_hash.update(client_key_exchange_msg[tls.record_header_len..]);
-                                const master_secret = hmacExpandLabel(P.Hmac, pre_master_secret, &.{
-                                    "master secret",
-                                    &client_hello_rand,
-                                    &server_hello_rand,
-                                }, 48);
-                                if (options.ssl_key_log_file) |key_log_file| logSecrets(key_log_file, .{
-                                    .client_random = &client_hello_rand,
-                                }, .{
-                                    .CLIENT_RANDOM = &master_secret,
-                                });
-                                const key_block = hmacExpandLabel(
-                                    P.Hmac,
-                                    &master_secret,
-                                    &.{ "key expansion", &server_hello_rand, &client_hello_rand },
-                                    @sizeOf(P.Tls_1_2),
-                                );
-                                const client_verify_cleartext = .{@intFromEnum(tls.HandshakeType.finished)} ++
-                                    array(u24, u8, hmacExpandLabel(
-                                        P.Hmac,
-                                        &master_secret,
-                                        &.{ "client finished", &p.transcript_hash.peek() },
-                                        P.verify_data_length,
-                                    ));
-                                p.transcript_hash.update(&client_verify_cleartext);
-                                p.version = .{ .tls_1_2 = .{
-                                    .expected_server_verify_data = hmacExpandLabel(
-                                        P.Hmac,
-                                        &master_secret,
-                                        &.{ "server finished", &p.transcript_hash.finalResult() },
-                                        P.verify_data_length,
-                                    ),
-                                    .app_cipher = std.mem.bytesToValue(P.Tls_1_2, &key_block),
-                                } };
-                                const pv = &p.version.tls_1_2;
-                                const nonce: [P.AEAD.nonce_length]u8 = nonce: {
-                                    const V = @Vector(P.AEAD.nonce_length, u8);
-                                    const pad = [1]u8{0} ** (P.AEAD.nonce_length - 8);
-                                    const operand: V = pad ++ @as([8]u8, @bitCast(big(write_seq)));
-                                    break :nonce @as(V, pv.app_cipher.client_write_IV ++ pv.app_cipher.client_salt) ^ operand;
-                                };
-                                var client_verify_msg = .{@intFromEnum(tls.ContentType.handshake)} ++
-                                    int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
-                                    array(u16, u8, nonce[P.fixed_iv_length..].* ++
-                                        @as([client_verify_cleartext.len + P.mac_length]u8, undefined));
-                                P.AEAD.encrypt(
-                                    client_verify_msg[client_verify_msg.len - P.mac_length -
-                                        client_verify_cleartext.len ..][0..client_verify_cleartext.len],
-                                    client_verify_msg[client_verify_msg.len - P.mac_length ..][0..P.mac_length],
-                                    &client_verify_cleartext,
-                                    std.mem.toBytes(big(write_seq)) ++ client_verify_msg[0 .. 1 + 2] ++ int(u16, client_verify_cleartext.len),
-                                    nonce,
-                                    pv.app_cipher.client_write_key,
-                                );
-                                const all_msgs = client_key_exchange_msg ++ client_change_cipher_spec_msg ++ client_verify_msg;
-                                var all_msgs_vec = [_]std.posix.iovec_const{
-                                    .{ .base = &all_msgs, .len = all_msgs.len },
-                                };
-                                try stream.writevAll(&all_msgs_vec);
-                            },
-                        }
-                        write_seq += 1;
-                        pending_cipher_state = .application;
-                        handshake_state = .finished;
-                    },
-                    .certificate_verify => {
-                        if (tls_version != .tls_1_3) return error.TlsUnexpectedMessage;
-                        if (cipher_state != .handshake) return error.TlsUnexpectedMessage;
-                        switch (handshake_state) {
-                            .trust_chain_established => {},
-                            .certificate => return error.TlsCertificateNotVerified,
-                            else => return error.TlsUnexpectedMessage,
-                        }
-                        switch (handshake_cipher) {
-                            inline else => |*p| {
-                                try main_cert_pub_key.verifySignature(&hsd, &.{
-                                    " " ** 64 ++ "TLS 1.3, server CertificateVerify\x00",
-                                    &p.transcript_hash.peek(),
-                                });
-                                p.transcript_hash.update(wrapped_handshake);
-                            },
-                        }
-                        handshake_state = .finished;
-                    },
-                    .finished => {
-                        if (cipher_state == .cleartext) return error.TlsUnexpectedMessage;
-                        if (handshake_state != .finished) return error.TlsUnexpectedMessage;
-                        // This message is to trick buggy proxies into behaving correctly.
-                        const client_change_cipher_spec_msg = .{@intFromEnum(tls.ContentType.change_cipher_spec)} ++
-                            int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
-                            array(u16, tls.ChangeCipherSpecType, .{.change_cipher_spec});
-                        const app_cipher = app_cipher: switch (handshake_cipher) {
-                            inline else => |*p, tag| switch (tls_version) {
-                                .tls_1_3 => {
+                var cleartext_fragment_start: usize = 0;
+                var cleartext_fragment_end: usize = 0;
+                var cleartext_bufs: [2][tls.max_ciphertext_inner_record_len]u8 = undefined;
+                var handshake_buffer: [tls.max_ciphertext_record_len]u8 = undefined;
+                var d: tls.Decoder = .{ .buf = &handshake_buffer };
+                fragment: while (true) {
+                    try d.readAtLeastOurAmt(stream, tls.record_header_len);
+                    const record_header = d.buf[d.idx..][0..tls.record_header_len];
+                    const record_ct = d.decode(tls.ContentType);
+                    d.skip(2); // legacy_version
+                    const record_len = d.decode(u16);
+                    try d.readAtLeast(stream, record_len);
+                    var record_decoder = try d.sub(record_len);
+                    var ctd, const ct = content: switch (cipher_state) {
+                        .cleartext => .{ record_decoder, record_ct },
+                        .handshake => {
+                            std.debug.assert(tls_version == .tls_1_3);
+                            if (record_ct != .application_data) return error.TlsUnexpectedMessage;
+                            try record_decoder.ensure(record_len);
+                            const cleartext_buf = &cleartext_bufs[cert_buf_index % 2];
+                            switch (handshake_cipher) {
+                                inline else => |*p| {
                                     const pv = &p.version.tls_1_3;
                                     const P = @TypeOf(p.*).A;
-                                    try hsd.ensure(P.Hmac.mac_length);
-                                    const finished_digest = p.transcript_hash.peek();
-                                    p.transcript_hash.update(wrapped_handshake);
-                                    const expected_server_verify_data = tls.hmac(P.Hmac, &finished_digest, pv.server_finished_key);
-                                    if (!std.crypto.timing_safe.eql([P.Hmac.mac_length]u8, expected_server_verify_data, hsd.array(P.Hmac.mac_length).*)) return error.TlsDecryptError;
-                                    const handshake_hash = p.transcript_hash.finalResult();
-                                    const verify_data = tls.hmac(P.Hmac, &handshake_hash, pv.client_finished_key);
-                                    const out_cleartext = .{@intFromEnum(tls.HandshakeType.finished)} ++
-                                        array(u24, u8, verify_data) ++
-                                        .{@intFromEnum(tls.ContentType.handshake)};
-
-                                    const wrapped_len = out_cleartext.len + P.AEAD.tag_length;
-
-                                    var finished_msg = .{@intFromEnum(tls.ContentType.application_data)} ++
-                                        int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
-                                        array(u16, u8, @as([wrapped_len]u8, undefined));
-
-                                    const ad = finished_msg[0..tls.record_header_len];
-                                    const ciphertext = finished_msg[tls.record_header_len..][0..out_cleartext.len];
-                                    const auth_tag = finished_msg[finished_msg.len - P.AEAD.tag_length ..];
-                                    const nonce = pv.client_handshake_iv;
-                                    P.AEAD.encrypt(ciphertext, auth_tag, &out_cleartext, ad, nonce, pv.client_handshake_key);
-
-                                    const all_msgs = client_change_cipher_spec_msg ++ finished_msg;
-                                    var all_msgs_vec = [_]std.posix.iovec_const{
-                                        .{ .base = &all_msgs, .len = all_msgs.len },
+                                    if (record_len < P.AEAD.tag_length) return error.TlsRecordOverflow;
+                                    const ciphertext = record_decoder.slice(record_len - P.AEAD.tag_length);
+                                    const cleartext_fragment_buf = cleartext_buf[cleartext_fragment_end..];
+                                    if (ciphertext.len > cleartext_fragment_buf.len) return error.TlsRecordOverflow;
+                                    const cleartext = cleartext_fragment_buf[0..ciphertext.len];
+                                    const auth_tag = record_decoder.array(P.AEAD.tag_length).*;
+                                    const nonce = nonce: {
+                                        const V = @Vector(P.AEAD.nonce_length, u8);
+                                        const pad = [1]u8{0} ** (P.AEAD.nonce_length - 8);
+                                        const operand: V = pad ++ @as([8]u8, @bitCast(big(read_seq)));
+                                        break :nonce @as(V, pv.server_handshake_iv) ^ operand;
                                     };
-                                    try stream.writevAll(&all_msgs_vec);
-
-                                    const client_secret = hkdfExpandLabel(P.Hkdf, pv.master_secret, "c ap traffic", &handshake_hash, P.Hash.digest_length);
-                                    const server_secret = hkdfExpandLabel(P.Hkdf, pv.master_secret, "s ap traffic", &handshake_hash, P.Hash.digest_length);
-                                    if (options.ssl_key_log_file) |key_log_file| logSecrets(key_log_file, .{
-                                        .counter = key_seq,
-                                        .client_random = &client_hello_rand,
-                                    }, .{
-                                        .SERVER_TRAFFIC_SECRET = &server_secret,
-                                        .CLIENT_TRAFFIC_SECRET = &client_secret,
-                                    });
-                                    key_seq += 1;
-                                    break :app_cipher @unionInit(tls.ApplicationCipher, @tagName(tag), .{ .tls_1_3 = .{
-                                        .client_secret = client_secret,
-                                        .server_secret = server_secret,
-                                        .client_key = hkdfExpandLabel(P.Hkdf, client_secret, "key", "", P.AEAD.key_length),
-                                        .server_key = hkdfExpandLabel(P.Hkdf, server_secret, "key", "", P.AEAD.key_length),
-                                        .client_iv = hkdfExpandLabel(P.Hkdf, client_secret, "iv", "", P.AEAD.nonce_length),
-                                        .server_iv = hkdfExpandLabel(P.Hkdf, server_secret, "iv", "", P.AEAD.nonce_length),
-                                    } });
+                                    P.AEAD.decrypt(cleartext, ciphertext, auth_tag, record_header, nonce, pv.server_handshake_key) catch
+                                        return error.TlsBadRecordMac;
+                                    cleartext_fragment_end += std.mem.trimEnd(u8, cleartext, "\x00").len;
                                 },
-                                .tls_1_2 => {
+                            }
+                            read_seq += 1;
+                            cleartext_fragment_end -= 1;
+                            const ct: tls.ContentType = @enumFromInt(cleartext_buf[cleartext_fragment_end]);
+                            if (ct != .handshake) return error.TlsUnexpectedMessage;
+                            break :content .{ tls.Decoder.fromTheirSlice(@constCast(cleartext_buf[cleartext_fragment_start..cleartext_fragment_end])), ct };
+                        },
+                        .application => {
+                            std.debug.assert(tls_version == .tls_1_2);
+                            if (record_ct != .handshake) return error.TlsUnexpectedMessage;
+                            try record_decoder.ensure(record_len);
+                            const cleartext_buf = &cleartext_bufs[cert_buf_index % 2];
+                            switch (handshake_cipher) {
+                                inline else => |*p| {
                                     const pv = &p.version.tls_1_2;
                                     const P = @TypeOf(p.*).A;
-                                    try hsd.ensure(P.verify_data_length);
-                                    if (!std.crypto.timing_safe.eql([P.verify_data_length]u8, pv.expected_server_verify_data, hsd.array(P.verify_data_length).*)) return error.TlsDecryptError;
-                                    break :app_cipher @unionInit(tls.ApplicationCipher, @tagName(tag), .{ .tls_1_2 = pv.app_cipher });
+                                    if (record_len < P.record_iv_length + P.mac_length) return error.TlsRecordOverflow;
+                                    const message_len: u16 = record_len - P.record_iv_length - P.mac_length;
+                                    const cleartext_fragment_buf = cleartext_buf[cleartext_fragment_end..];
+                                    if (message_len > cleartext_fragment_buf.len) return error.TlsRecordOverflow;
+                                    const cleartext = cleartext_fragment_buf[0..message_len];
+                                    const ad = std.mem.toBytes(big(read_seq)) ++
+                                        record_header[0 .. 1 + 2] ++
+                                        std.mem.toBytes(big(message_len));
+                                    const record_iv = record_decoder.array(P.record_iv_length).*;
+                                    const masked_read_seq = read_seq &
+                                        comptime std.math.shl(u64, std.math.maxInt(u64), 8 * P.record_iv_length);
+                                    const nonce: [P.AEAD.nonce_length]u8 = nonce: {
+                                        const V = @Vector(P.AEAD.nonce_length, u8);
+                                        const pad = [1]u8{0} ** (P.AEAD.nonce_length - 8);
+                                        const operand: V = pad ++ @as([8]u8, @bitCast(big(masked_read_seq)));
+                                        break :nonce @as(V, pv.app_cipher.server_write_IV ++ record_iv) ^ operand;
+                                    };
+                                    const ciphertext = record_decoder.slice(message_len);
+                                    const auth_tag = record_decoder.array(P.mac_length);
+                                    P.AEAD.decrypt(cleartext, ciphertext, auth_tag.*, ad, nonce, pv.app_cipher.server_write_key) catch return error.TlsBadRecordMac;
+                                    cleartext_fragment_end += message_len;
                                 },
-                                else => unreachable,
-                            },
-                        };
-                        const leftover = d.rest();
-                        var client: Client = .{
-                            .tls_version = tls_version,
-                            .read_seq = switch (tls_version) {
-                                .tls_1_3 => 0,
-                                .tls_1_2 => read_seq,
-                                else => unreachable,
-                            },
-                            .write_seq = switch (tls_version) {
-                                .tls_1_3 => 0,
-                                .tls_1_2 => write_seq,
-                                else => unreachable,
-                            },
-                            .partial_cleartext_idx = 0,
-                            .partial_ciphertext_idx = 0,
-                            .partial_ciphertext_end = @intCast(leftover.len),
-                            .received_close_notify = false,
-                            .allow_truncation_attacks = false,
-                            .application_cipher = app_cipher,
-                            .partially_read_buffer = undefined,
-                            .ssl_key_log = if (options.ssl_key_log_file) |key_log_file| .{
-                                .client_key_seq = key_seq,
-                                .server_key_seq = key_seq,
-                                .client_random = client_hello_rand,
-                                .file = key_log_file,
-                            } else null,
-                        };
-                        @memcpy(client.partially_read_buffer[0..leftover.len], leftover);
-                        return client;
-                    },
-                    else => return error.TlsUnexpectedMessage,
+                            }
+                            read_seq += 1;
+                            break :content .{ tls.Decoder.fromTheirSlice(cleartext_buf[cleartext_fragment_start..cleartext_fragment_end]), record_ct };
+                        },
+                    };
+                    switch (ct) {
+                        .alert => {
+                            ctd.ensure(2) catch continue :fragment;
+                            const level = ctd.decode(tls.AlertLevel);
+                            const desc = ctd.decode(tls.AlertDescription);
+                            _ = level;
+
+                            // if this isn't a error alert, then it's a closure alert, which makes no sense in a handshake
+                            try desc.toError();
+                            // TODO: handle server-side closures
+                            return error.TlsUnexpectedMessage;
+                        },
+                        .change_cipher_spec => {
+                            ctd.ensure(1) catch continue :fragment;
+                            if (ctd.decode(tls.ChangeCipherSpecType) != .change_cipher_spec) return error.TlsIllegalParameter;
+                            cipher_state = pending_cipher_state;
+                        },
+                        .handshake => while (true) {
+                            ctd.ensure(4) catch continue :fragment;
+                            const handshake_type = ctd.decode(tls.HandshakeType);
+                            const handshake_len = ctd.decode(u24);
+                            var hsd = ctd.sub(handshake_len) catch continue :fragment;
+                            const wrapped_handshake = ctd.buf[ctd.idx - handshake_len - 4 .. ctd.idx];
+                            switch (handshake_type) {
+                                .server_hello => {
+                                    if (cipher_state != .cleartext) return error.TlsUnexpectedMessage;
+                                    if (handshake_state != .hello) return error.TlsUnexpectedMessage;
+                                    try hsd.ensure(2 + 32 + 1);
+                                    const legacy_version = hsd.decode(u16);
+                                    @memcpy(&self.server_hello_rand, hsd.array(32));
+                                    if (mem.eql(u8, &self.server_hello_rand, &tls.hello_retry_request_sequence)) {
+                                        // This is a HelloRetryRequest message. This client implementation
+                                        // does not expect to get one.
+                                        return error.TlsUnexpectedMessage;
+                                    }
+                                    const legacy_session_id_echo_len = hsd.decode(u8);
+                                    try hsd.ensure(legacy_session_id_echo_len + 2 + 1);
+                                    const legacy_session_id_echo = hsd.slice(legacy_session_id_echo_len);
+                                    const cipher_suite_tag = hsd.decode(tls.CipherSuite);
+                                    hsd.skip(1); // legacy_compression_method
+                                    var supported_version: ?u16 = null;
+                                    if (!hsd.eof()) {
+                                        try hsd.ensure(2);
+                                        const extensions_size = hsd.decode(u16);
+                                        var all_extd = try hsd.sub(extensions_size);
+                                        while (!all_extd.eof()) {
+                                            try all_extd.ensure(2 + 2);
+                                            const et = all_extd.decode(tls.ExtensionType);
+                                            const ext_size = all_extd.decode(u16);
+                                            var extd = try all_extd.sub(ext_size);
+                                            switch (et) {
+                                                .supported_versions => {
+                                                    if (supported_version) |_| return error.TlsIllegalParameter;
+                                                    try extd.ensure(2);
+                                                    supported_version = extd.decode(u16);
+                                                },
+                                                .key_share => {
+                                                    if (self.key_share.getSharedSecret()) |_| return error.TlsIllegalParameter;
+                                                    try extd.ensure(4);
+                                                    const named_group = extd.decode(tls.NamedGroup);
+                                                    const key_size = extd.decode(u16);
+                                                    try extd.ensure(key_size);
+                                                    try self.key_share.exchange(named_group, extd.slice(key_size));
+                                                },
+                                                else => {},
+                                            }
+                                        }
+                                    }
+
+                                    tls_version = @enumFromInt(supported_version orelse legacy_version);
+                                    switch (tls_version) {
+                                        .tls_1_3 => if (!mem.eql(u8, legacy_session_id_echo, &self.legacy_session_id)) return error.TlsIllegalParameter,
+                                        .tls_1_2 => if (mem.eql(u8, self.server_hello_rand[24..31], "DOWNGRD") and
+                                            self.server_hello_rand[31] >> 1 == 0x00) return error.TlsIllegalParameter,
+                                        else => return error.TlsIllegalParameter,
+                                    }
+
+                                    switch (cipher_suite_tag) {
+                                        inline .AES_128_GCM_SHA256,
+                                        .AES_256_GCM_SHA384,
+                                        .CHACHA20_POLY1305_SHA256,
+                                        .AEGIS_256_SHA512,
+                                        .AEGIS_128L_SHA256,
+
+                                        .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+                                        .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+                                        .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+                                        => |tag| {
+                                            handshake_cipher = @unionInit(tls.HandshakeCipher, @tagName(tag.with()), .{
+                                                .transcript_hash = .init(.{}),
+                                                .version = undefined,
+                                            });
+                                            const p = &@field(handshake_cipher, @tagName(tag.with()));
+                                            p.transcript_hash.update(self.cleartext_header[tls.record_header_len..]); // Client Hello part 1
+                                            p.transcript_hash.update(self.host); // Client Hello part 2
+                                            p.transcript_hash.update(wrapped_handshake);
+                                        },
+
+                                        else => return error.TlsIllegalParameter,
+                                    }
+                                    switch (tls_version) {
+                                        .tls_1_3 => {
+                                            switch (cipher_suite_tag) {
+                                                inline .AES_128_GCM_SHA256,
+                                                .AES_256_GCM_SHA384,
+                                                .CHACHA20_POLY1305_SHA256,
+                                                .AEGIS_256_SHA512,
+                                                .AEGIS_128L_SHA256,
+                                                => |tag| {
+                                                    const sk = self.key_share.getSharedSecret() orelse return error.TlsIllegalParameter;
+                                                    const p = &@field(handshake_cipher, @tagName(tag.with()));
+                                                    const P = @TypeOf(p.*).A;
+                                                    const hello_hash = p.transcript_hash.peek();
+                                                    const zeroes = [1]u8{0} ** P.Hash.digest_length;
+                                                    const early_secret = P.Hkdf.extract(&[1]u8{0}, &zeroes);
+                                                    const empty_hash = tls.emptyHash(P.Hash);
+                                                    p.version = .{ .tls_1_3 = undefined };
+                                                    const pv = &p.version.tls_1_3;
+                                                    const hs_derived_secret = hkdfExpandLabel(P.Hkdf, early_secret, "derived", &empty_hash, P.Hash.digest_length);
+                                                    pv.handshake_secret = P.Hkdf.extract(&hs_derived_secret, sk);
+                                                    const ap_derived_secret = hkdfExpandLabel(P.Hkdf, pv.handshake_secret, "derived", &empty_hash, P.Hash.digest_length);
+                                                    pv.master_secret = P.Hkdf.extract(&ap_derived_secret, &zeroes);
+                                                    const client_secret = hkdfExpandLabel(P.Hkdf, pv.handshake_secret, "c hs traffic", &hello_hash, P.Hash.digest_length);
+                                                    const server_secret = hkdfExpandLabel(P.Hkdf, pv.handshake_secret, "s hs traffic", &hello_hash, P.Hash.digest_length);
+                                                    if (self.options.ssl_key_log_file) |key_log_file| logSecrets(key_log_file, .{
+                                                        .client_random = &self.client_hello_rand,
+                                                    }, .{
+                                                        .SERVER_HANDSHAKE_TRAFFIC_SECRET = &server_secret,
+                                                        .CLIENT_HANDSHAKE_TRAFFIC_SECRET = &client_secret,
+                                                    });
+                                                    pv.client_finished_key = hkdfExpandLabel(P.Hkdf, client_secret, "finished", "", P.Hmac.key_length);
+                                                    pv.server_finished_key = hkdfExpandLabel(P.Hkdf, server_secret, "finished", "", P.Hmac.key_length);
+                                                    pv.client_handshake_key = hkdfExpandLabel(P.Hkdf, client_secret, "key", "", P.AEAD.key_length);
+                                                    pv.server_handshake_key = hkdfExpandLabel(P.Hkdf, server_secret, "key", "", P.AEAD.key_length);
+                                                    pv.client_handshake_iv = hkdfExpandLabel(P.Hkdf, client_secret, "iv", "", P.AEAD.nonce_length);
+                                                    pv.server_handshake_iv = hkdfExpandLabel(P.Hkdf, server_secret, "iv", "", P.AEAD.nonce_length);
+                                                },
+                                                else => return error.TlsIllegalParameter,
+                                            }
+                                            pending_cipher_state = .handshake;
+                                            handshake_state = .encrypted_extensions;
+                                        },
+                                        .tls_1_2 => switch (cipher_suite_tag) {
+                                            .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+                                            .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+                                            .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+                                            => handshake_state = .certificate,
+                                            else => return error.TlsIllegalParameter,
+                                        },
+                                        else => return error.TlsIllegalParameter,
+                                    }
+                                },
+                                .encrypted_extensions => {
+                                    if (tls_version != .tls_1_3) return error.TlsUnexpectedMessage;
+                                    if (cipher_state != .handshake) return error.TlsUnexpectedMessage;
+                                    if (handshake_state != .encrypted_extensions) return error.TlsUnexpectedMessage;
+                                    switch (handshake_cipher) {
+                                        inline else => |*p| p.transcript_hash.update(wrapped_handshake),
+                                    }
+                                    try hsd.ensure(2);
+                                    const total_ext_size = hsd.decode(u16);
+                                    var all_extd = try hsd.sub(total_ext_size);
+                                    while (!all_extd.eof()) {
+                                        try all_extd.ensure(4);
+                                        const et = all_extd.decode(tls.ExtensionType);
+                                        const ext_size = all_extd.decode(u16);
+                                        const extd = try all_extd.sub(ext_size);
+                                        _ = extd;
+                                        switch (et) {
+                                            .server_name => {},
+                                            else => {},
+                                        }
+                                    }
+                                    handshake_state = .certificate;
+                                },
+                                .certificate => cert: {
+                                    if (cipher_state == .application) return error.TlsUnexpectedMessage;
+                                    switch (handshake_state) {
+                                        .certificate => {},
+                                        .trust_chain_established => break :cert,
+                                        else => return error.TlsUnexpectedMessage,
+                                    }
+                                    switch (handshake_cipher) {
+                                        inline else => |*p| p.transcript_hash.update(wrapped_handshake),
+                                    }
+
+                                    switch (tls_version) {
+                                        .tls_1_3 => {
+                                            try hsd.ensure(1 + 3);
+                                            const cert_req_ctx_len = hsd.decode(u8);
+                                            if (cert_req_ctx_len != 0) return error.TlsIllegalParameter;
+                                        },
+                                        .tls_1_2 => try hsd.ensure(3),
+                                        else => unreachable,
+                                    }
+                                    const certs_size = hsd.decode(u24);
+                                    var certs_decoder = try hsd.sub(certs_size);
+                                    while (!certs_decoder.eof()) {
+                                        try certs_decoder.ensure(3);
+                                        const cert_size = certs_decoder.decode(u24);
+                                        const certd = try certs_decoder.sub(cert_size);
+
+                                        if (tls_version == .tls_1_3) {
+                                            try certs_decoder.ensure(2);
+                                            const total_ext_size = certs_decoder.decode(u16);
+                                            const all_extd = try certs_decoder.sub(total_ext_size);
+                                            _ = all_extd;
+                                        }
+
+                                        const subject_cert: Certificate = .{
+                                            .buffer = certd.buf,
+                                            .index = @intCast(certd.idx),
+                                        };
+                                        const subject = try subject_cert.parse();
+                                        if (cert_index == 0) {
+                                            // Verify the host on the first certificate.
+                                            switch (self.options.host) {
+                                                .no_verification => {},
+                                                .explicit => try subject.verifyHostName(self.host),
+                                            }
+
+                                            // Keep track of the public key for the
+                                            // certificate_verify message later.
+                                            try main_cert_pub_key.init(subject.pub_key_algo, subject.pubKey());
+                                        } else {
+                                            try prev_cert.verify(subject, now_sec);
+                                        }
+
+                                        switch (self.options.ca) {
+                                            .no_verification => {
+                                                handshake_state = .trust_chain_established;
+                                                break :cert;
+                                            },
+                                            .self_signed => {
+                                                try subject.verify(subject, now_sec);
+                                                handshake_state = .trust_chain_established;
+                                                break :cert;
+                                            },
+                                            .bundle => |ca_bundle| if (ca_bundle.verify(subject, now_sec)) |_| {
+                                                handshake_state = .trust_chain_established;
+                                                break :cert;
+                                            } else |err| switch (err) {
+                                                error.CertificateIssuerNotFound => {},
+                                                else => |e| return e,
+                                            },
+                                        }
+
+                                        prev_cert = subject;
+                                        cert_index += 1;
+                                    }
+                                    cert_buf_index += 1;
+                                },
+                                .server_key_exchange => {
+                                    if (tls_version != .tls_1_2) return error.TlsUnexpectedMessage;
+                                    if (cipher_state != .cleartext) return error.TlsUnexpectedMessage;
+                                    switch (handshake_state) {
+                                        .trust_chain_established => {},
+                                        .certificate => return error.TlsCertificateNotVerified,
+                                        else => return error.TlsUnexpectedMessage,
+                                    }
+
+                                    switch (handshake_cipher) {
+                                        inline else => |*p| p.transcript_hash.update(wrapped_handshake),
+                                    }
+                                    try hsd.ensure(1 + 2 + 1);
+                                    const curve_type = hsd.decode(u8);
+                                    if (curve_type != 0x03) return error.TlsIllegalParameter; // named_curve
+                                    const named_group = hsd.decode(tls.NamedGroup);
+                                    const key_size = hsd.decode(u8);
+                                    try hsd.ensure(key_size);
+                                    const server_pub_key = hsd.slice(key_size);
+                                    try main_cert_pub_key.verifySignature(&hsd, &.{ &self.client_hello_rand, &self.server_hello_rand, hsd.buf[0..hsd.idx] });
+                                    try self.key_share.exchange(named_group, server_pub_key);
+                                    handshake_state = .server_hello_done;
+                                },
+                                .server_hello_done => {
+                                    if (tls_version != .tls_1_2) return error.TlsUnexpectedMessage;
+                                    if (cipher_state != .cleartext) return error.TlsUnexpectedMessage;
+                                    if (handshake_state != .server_hello_done) return error.TlsUnexpectedMessage;
+
+                                    const client_key_exchange_msg = .{@intFromEnum(tls.ContentType.handshake)} ++
+                                        int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
+                                        array(u16, u8, .{@intFromEnum(tls.HandshakeType.client_key_exchange)} ++
+                                            array(u24, u8, array(u8, u8, self.key_share.secp256r1_kp.public_key.toUncompressedSec1())));
+                                    const client_change_cipher_spec_msg = .{@intFromEnum(tls.ContentType.change_cipher_spec)} ++
+                                        int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
+                                        array(u16, tls.ChangeCipherSpecType, .{.change_cipher_spec});
+                                    const pre_master_secret = self.key_share.getSharedSecret().?;
+                                    switch (handshake_cipher) {
+                                        inline else => |*p| {
+                                            const P = @TypeOf(p.*).A;
+                                            p.transcript_hash.update(wrapped_handshake);
+                                            p.transcript_hash.update(client_key_exchange_msg[tls.record_header_len..]);
+                                            const master_secret = hmacExpandLabel(P.Hmac, pre_master_secret, &.{
+                                                "master secret",
+                                                &self.client_hello_rand,
+                                                &self.server_hello_rand,
+                                            }, 48);
+                                            if (self.options.ssl_key_log_file) |key_log_file| logSecrets(key_log_file, .{
+                                                .client_random = &self.client_hello_rand,
+                                            }, .{
+                                                .CLIENT_RANDOM = &master_secret,
+                                            });
+                                            const key_block = hmacExpandLabel(
+                                                P.Hmac,
+                                                &master_secret,
+                                                &.{ "key expansion", &self.server_hello_rand, &self.client_hello_rand },
+                                                @sizeOf(P.Tls_1_2),
+                                            );
+                                            const client_verify_cleartext = .{@intFromEnum(tls.HandshakeType.finished)} ++
+                                                array(u24, u8, hmacExpandLabel(
+                                                    P.Hmac,
+                                                    &master_secret,
+                                                    &.{ "client finished", &p.transcript_hash.peek() },
+                                                    P.verify_data_length,
+                                                ));
+                                            p.transcript_hash.update(&client_verify_cleartext);
+                                            p.version = .{ .tls_1_2 = .{
+                                                .expected_server_verify_data = hmacExpandLabel(
+                                                    P.Hmac,
+                                                    &master_secret,
+                                                    &.{ "server finished", &p.transcript_hash.finalResult() },
+                                                    P.verify_data_length,
+                                                ),
+                                                .app_cipher = std.mem.bytesToValue(P.Tls_1_2, &key_block),
+                                            } };
+                                            const pv = &p.version.tls_1_2;
+                                            const nonce: [P.AEAD.nonce_length]u8 = nonce: {
+                                                const V = @Vector(P.AEAD.nonce_length, u8);
+                                                const pad = [1]u8{0} ** (P.AEAD.nonce_length - 8);
+                                                const operand: V = pad ++ @as([8]u8, @bitCast(big(write_seq)));
+                                                break :nonce @as(V, pv.app_cipher.client_write_IV ++ pv.app_cipher.client_salt) ^ operand;
+                                            };
+                                            var client_verify_msg = .{@intFromEnum(tls.ContentType.handshake)} ++
+                                                int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
+                                                array(u16, u8, nonce[P.fixed_iv_length..].* ++
+                                                    @as([client_verify_cleartext.len + P.mac_length]u8, undefined));
+                                            P.AEAD.encrypt(
+                                                client_verify_msg[client_verify_msg.len - P.mac_length -
+                                                    client_verify_cleartext.len ..][0..client_verify_cleartext.len],
+                                                client_verify_msg[client_verify_msg.len - P.mac_length ..][0..P.mac_length],
+                                                &client_verify_cleartext,
+                                                std.mem.toBytes(big(write_seq)) ++ client_verify_msg[0 .. 1 + 2] ++ int(u16, client_verify_cleartext.len),
+                                                nonce,
+                                                pv.app_cipher.client_write_key,
+                                            );
+                                            const all_msgs = client_key_exchange_msg ++ client_change_cipher_spec_msg ++ client_verify_msg;
+                                            var all_msgs_vec = [_]std.posix.iovec_const{
+                                                .{ .base = &all_msgs, .len = all_msgs.len },
+                                            };
+                                            try stream.writevAll(&all_msgs_vec);
+                                        },
+                                    }
+                                    write_seq += 1;
+                                    pending_cipher_state = .application;
+                                    handshake_state = .finished;
+                                },
+                                .certificate_verify => {
+                                    if (tls_version != .tls_1_3) return error.TlsUnexpectedMessage;
+                                    if (cipher_state != .handshake) return error.TlsUnexpectedMessage;
+                                    switch (handshake_state) {
+                                        .trust_chain_established => {},
+                                        .certificate => return error.TlsCertificateNotVerified,
+                                        else => return error.TlsUnexpectedMessage,
+                                    }
+                                    switch (handshake_cipher) {
+                                        inline else => |*p| {
+                                            try main_cert_pub_key.verifySignature(&hsd, &.{
+                                                " " ** 64 ++ "TLS 1.3, server CertificateVerify\x00",
+                                                &p.transcript_hash.peek(),
+                                            });
+                                            p.transcript_hash.update(wrapped_handshake);
+                                        },
+                                    }
+                                    handshake_state = .finished;
+                                },
+                                .finished => {
+                                    if (cipher_state == .cleartext) return error.TlsUnexpectedMessage;
+                                    if (handshake_state != .finished) return error.TlsUnexpectedMessage;
+                                    // This message is to trick buggy proxies into behaving correctly.
+                                    const client_change_cipher_spec_msg = .{@intFromEnum(tls.ContentType.change_cipher_spec)} ++
+                                        int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
+                                        array(u16, tls.ChangeCipherSpecType, .{.change_cipher_spec});
+                                    const app_cipher = app_cipher: switch (handshake_cipher) {
+                                        inline else => |*p, tag| switch (tls_version) {
+                                            .tls_1_3 => {
+                                                const pv = &p.version.tls_1_3;
+                                                const P = @TypeOf(p.*).A;
+                                                try hsd.ensure(P.Hmac.mac_length);
+                                                const finished_digest = p.transcript_hash.peek();
+                                                p.transcript_hash.update(wrapped_handshake);
+                                                const expected_server_verify_data = tls.hmac(P.Hmac, &finished_digest, pv.server_finished_key);
+                                                if (!std.crypto.timing_safe.eql([P.Hmac.mac_length]u8, expected_server_verify_data, hsd.array(P.Hmac.mac_length).*)) return error.TlsDecryptError;
+                                                const handshake_hash = p.transcript_hash.finalResult();
+                                                const verify_data = tls.hmac(P.Hmac, &handshake_hash, pv.client_finished_key);
+                                                const out_cleartext = .{@intFromEnum(tls.HandshakeType.finished)} ++
+                                                    array(u24, u8, verify_data) ++
+                                                    .{@intFromEnum(tls.ContentType.handshake)};
+
+                                                const wrapped_len = out_cleartext.len + P.AEAD.tag_length;
+
+                                                var finished_msg = .{@intFromEnum(tls.ContentType.application_data)} ++
+                                                    int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
+                                                    array(u16, u8, @as([wrapped_len]u8, undefined));
+
+                                                const ad = finished_msg[0..tls.record_header_len];
+                                                const ciphertext = finished_msg[tls.record_header_len..][0..out_cleartext.len];
+                                                const auth_tag = finished_msg[finished_msg.len - P.AEAD.tag_length ..];
+                                                const nonce = pv.client_handshake_iv;
+                                                P.AEAD.encrypt(ciphertext, auth_tag, &out_cleartext, ad, nonce, pv.client_handshake_key);
+
+                                                const all_msgs = client_change_cipher_spec_msg ++ finished_msg;
+                                                var all_msgs_vec = [_]std.posix.iovec_const{
+                                                    .{ .base = &all_msgs, .len = all_msgs.len },
+                                                };
+                                                try stream.writevAll(&all_msgs_vec);
+
+                                                const client_secret = hkdfExpandLabel(P.Hkdf, pv.master_secret, "c ap traffic", &handshake_hash, P.Hash.digest_length);
+                                                const server_secret = hkdfExpandLabel(P.Hkdf, pv.master_secret, "s ap traffic", &handshake_hash, P.Hash.digest_length);
+                                                if (self.options.ssl_key_log_file) |key_log_file| logSecrets(key_log_file, .{
+                                                    .counter = self.key_seq,
+                                                    .client_random = &self.client_hello_rand,
+                                                }, .{
+                                                    .SERVER_TRAFFIC_SECRET = &server_secret,
+                                                    .CLIENT_TRAFFIC_SECRET = &client_secret,
+                                                });
+                                                self.key_seq += 1;
+                                                break :app_cipher @unionInit(tls.ApplicationCipher, @tagName(tag), .{ .tls_1_3 = .{
+                                                    .client_secret = client_secret,
+                                                    .server_secret = server_secret,
+                                                    .client_key = hkdfExpandLabel(P.Hkdf, client_secret, "key", "", P.AEAD.key_length),
+                                                    .server_key = hkdfExpandLabel(P.Hkdf, server_secret, "key", "", P.AEAD.key_length),
+                                                    .client_iv = hkdfExpandLabel(P.Hkdf, client_secret, "iv", "", P.AEAD.nonce_length),
+                                                    .server_iv = hkdfExpandLabel(P.Hkdf, server_secret, "iv", "", P.AEAD.nonce_length),
+                                                } });
+                                            },
+                                            .tls_1_2 => {
+                                                const pv = &p.version.tls_1_2;
+                                                const P = @TypeOf(p.*).A;
+                                                try hsd.ensure(P.verify_data_length);
+                                                if (!std.crypto.timing_safe.eql([P.verify_data_length]u8, pv.expected_server_verify_data, hsd.array(P.verify_data_length).*)) return error.TlsDecryptError;
+                                                break :app_cipher @unionInit(tls.ApplicationCipher, @tagName(tag), .{ .tls_1_2 = pv.app_cipher });
+                                            },
+                                            else => unreachable,
+                                        },
+                                    };
+                                    const leftover = d.rest();
+                                    var client: Client = .{
+                                        .tls_version = tls_version,
+                                        .read_seq = switch (tls_version) {
+                                            .tls_1_3 => 0,
+                                            .tls_1_2 => read_seq,
+                                            else => unreachable,
+                                        },
+                                        .write_seq = switch (tls_version) {
+                                            .tls_1_3 => 0,
+                                            .tls_1_2 => write_seq,
+                                            else => unreachable,
+                                        },
+                                        .partial_cleartext_idx = 0,
+                                        .partial_ciphertext_idx = 0,
+                                        .partial_ciphertext_end = @intCast(leftover.len),
+                                        .received_close_notify = false,
+                                        .allow_truncation_attacks = false,
+                                        .application_cipher = app_cipher,
+                                        .partially_read_buffer = undefined,
+                                        .ssl_key_log = if (self.options.ssl_key_log_file) |key_log_file| .{
+                                            .client_key_seq = self.key_seq,
+                                            .server_key_seq = self.key_seq,
+                                            .client_random = self.client_hello_rand,
+                                            .file = key_log_file,
+                                        } else null,
+                                    };
+                                    @memcpy(client.partially_read_buffer[0..leftover.len], leftover);
+                                    return .{ .done = client };
+                                },
+                                else => return error.TlsUnexpectedMessage,
+                            }
+                            if (ctd.eof()) break;
+                            cleartext_fragment_start = ctd.idx;
+                        },
+                        else => return error.TlsUnexpectedMessage,
+                    }
+                    cleartext_fragment_start = 0;
+                    cleartext_fragment_end = 0;
                 }
-                if (ctd.eof()) break;
-                cleartext_fragment_start = ctd.idx;
             },
-            else => return error.TlsUnexpectedMessage,
+
+            .Done => return undefined,
         }
-        cleartext_fragment_start = 0;
-        cleartext_fragment_end = 0;
     }
-}
+};
 
 /// Sends TLS-encrypted data to `stream`, which must conform to `StreamInterface`.
 /// Returns the number of cleartext bytes sent, which may be fewer than `bytes.len`.
