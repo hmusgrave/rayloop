@@ -235,7 +235,7 @@ pub const TlsInit = struct {
         finished,
     };
 
-    pub const State = enum { CleartextHeader, PreFragment, Fragment, Done };
+    pub const State = enum { CleartextHeader, PreFragment, Fragment, FragmentReadTheirs, FragmentRemainder, Done };
     state: State = .CleartextHeader,
 
     options: Options = undefined,
@@ -271,6 +271,9 @@ pub const TlsInit = struct {
     cleartext_fragment_end: usize = 0,
     cleartext_bufs: [2][tls.max_ciphertext_inner_record_len]u8 = undefined,
     handshake_buffer: [tls.max_ciphertext_record_len]u8 = undefined,
+    record_header: []const u8 = undefined,
+    record_ct: tls.ContentType = undefined,
+    record_len: u16 = undefined,
 
     pub fn run(self: *@This(), stream: anytype, E: type, arg: RunArg(E)) InitError(@TypeOf(stream))!Result {
         outer: switch (self.state) {
@@ -378,26 +381,35 @@ pub const TlsInit = struct {
                 continue :outer .Fragment;
             },
             .Fragment => {
-                try self.d.readAtLeastOurAmt(stream, tls.record_header_len);
-                const record_header = self.d.buf[self.d.idx..][0..tls.record_header_len];
-                const record_ct = self.d.decode(tls.ContentType);
+                self.state = .FragmentReadTheirs;
+                return .{ .action = .{ .decoder = .{ .readAtLeastOurAmt = .{ .decoder = &self.d, .our_amt = tls.record_header_len } } } };
+            },
+            .FragmentReadTheirs => {
+                try arg.stream.decoder.readAtLeastOurAmt;
+
+                self.record_header = self.d.buf[self.d.idx..][0..tls.record_header_len];
+                self.record_ct = self.d.decode(tls.ContentType);
                 self.d.skip(2); // legacy_version
-                const record_len = self.d.decode(u16);
-                try self.d.readAtLeast(stream, record_len);
-                var record_decoder = try self.d.sub(record_len);
+                self.record_len = self.d.decode(u16);
+                self.state = .FragmentRemainder;
+                return .{ .action = .{ .decoder = .{ .readAtLeast = .{ .decoder = &self.d, .their_amt = self.record_len } } } };
+            },
+            .FragmentRemainder => {
+                try arg.stream.decoder.readAtLeast;
+                var record_decoder = try self.d.sub(self.record_len);
                 var ctd, const ct = content: switch (self.cipher_state) {
-                    .cleartext => .{ record_decoder, record_ct },
+                    .cleartext => .{ record_decoder, self.record_ct },
                     .handshake => {
                         std.debug.assert(self.tls_version == .tls_1_3);
-                        if (record_ct != .application_data) return error.TlsUnexpectedMessage;
-                        try record_decoder.ensure(record_len);
+                        if (self.record_ct != .application_data) return error.TlsUnexpectedMessage;
+                        try record_decoder.ensure(self.record_len);
                         const cleartext_buf = &self.cleartext_bufs[self.cert_buf_index % 2];
                         switch (self.handshake_cipher) {
                             inline else => |*p| {
                                 const pv = &p.version.tls_1_3;
                                 const P = @TypeOf(p.*).A;
-                                if (record_len < P.AEAD.tag_length) return error.TlsRecordOverflow;
-                                const ciphertext = record_decoder.slice(record_len - P.AEAD.tag_length);
+                                if (self.record_len < P.AEAD.tag_length) return error.TlsRecordOverflow;
+                                const ciphertext = record_decoder.slice(self.record_len - P.AEAD.tag_length);
                                 const cleartext_fragment_buf = cleartext_buf[self.cleartext_fragment_end..];
                                 if (ciphertext.len > cleartext_fragment_buf.len) return error.TlsRecordOverflow;
                                 const cleartext = cleartext_fragment_buf[0..ciphertext.len];
@@ -408,7 +420,7 @@ pub const TlsInit = struct {
                                     const operand: V = pad ++ @as([8]u8, @bitCast(big(self.read_seq)));
                                     break :nonce @as(V, pv.server_handshake_iv) ^ operand;
                                 };
-                                P.AEAD.decrypt(cleartext, ciphertext, auth_tag, record_header, nonce, pv.server_handshake_key) catch
+                                P.AEAD.decrypt(cleartext, ciphertext, auth_tag, self.record_header, nonce, pv.server_handshake_key) catch
                                     return error.TlsBadRecordMac;
                                 self.cleartext_fragment_end += std.mem.trimEnd(u8, cleartext, "\x00").len;
                             },
@@ -421,20 +433,20 @@ pub const TlsInit = struct {
                     },
                     .application => {
                         std.debug.assert(self.tls_version == .tls_1_2);
-                        if (record_ct != .handshake) return error.TlsUnexpectedMessage;
-                        try record_decoder.ensure(record_len);
+                        if (self.record_ct != .handshake) return error.TlsUnexpectedMessage;
+                        try record_decoder.ensure(self.record_len);
                         const cleartext_buf = &self.cleartext_bufs[self.cert_buf_index % 2];
                         switch (self.handshake_cipher) {
                             inline else => |*p| {
                                 const pv = &p.version.tls_1_2;
                                 const P = @TypeOf(p.*).A;
-                                if (record_len < P.record_iv_length + P.mac_length) return error.TlsRecordOverflow;
-                                const message_len: u16 = record_len - P.record_iv_length - P.mac_length;
+                                if (self.record_len < P.record_iv_length + P.mac_length) return error.TlsRecordOverflow;
+                                const message_len: u16 = self.record_len - P.record_iv_length - P.mac_length;
                                 const cleartext_fragment_buf = cleartext_buf[self.cleartext_fragment_end..];
                                 if (message_len > cleartext_fragment_buf.len) return error.TlsRecordOverflow;
                                 const cleartext = cleartext_fragment_buf[0..message_len];
                                 const ad = std.mem.toBytes(big(self.read_seq)) ++
-                                    record_header[0 .. 1 + 2] ++
+                                    self.record_header[0 .. 1 + 2] ++
                                     std.mem.toBytes(big(message_len));
                                 const record_iv = record_decoder.array(P.record_iv_length).*;
                                 const masked_read_seq = self.read_seq &
@@ -452,7 +464,7 @@ pub const TlsInit = struct {
                             },
                         }
                         self.read_seq += 1;
-                        break :content .{ tls.Decoder.fromTheirSlice(cleartext_buf[self.cleartext_fragment_start..self.cleartext_fragment_end]), record_ct };
+                        break :content .{ tls.Decoder.fromTheirSlice(cleartext_buf[self.cleartext_fragment_start..self.cleartext_fragment_end]), self.record_ct };
                     },
                 };
                 switch (ct) {
