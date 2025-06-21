@@ -220,6 +220,67 @@ pub const Read = IoUringSQE(ReadPayload, struct {
 // IoUring Composite Events
 //
 
+pub const Readv = struct {
+    pub const State = enum { Init, SQE, CQE, Done };
+    pub const Result = SQEError!usize;
+
+    client: i32,
+    iovecs: []std.posix.iovec,
+    i: usize = 0,
+    amt: usize = 0,
+
+    state: State = .Init,
+    result: Result = undefined,
+    scheduled: bool = false,
+    returned_from: PendingIndex = PendingIndex.empty(),
+    callback: PendingIndex = PendingIndex.empty(),
+
+    pub fn run(self: *@This(), loop: anytype) !void {
+        outer: switch (self.state) {
+            .Init => {
+                self.state = .SQE;
+                continue :outer .SQE;
+            },
+            .SQE => {
+                if (self.i >= self.iovecs.len) {
+                    self.result = self.amt;
+                    self.state = .Done;
+                    return;
+                }
+                const iovec = self.iovecs[self.i];
+                const buffer = iovec.base[0..iovec.len];
+                self.state = .CQE;
+                try loop.schedule_with_callback(Read{
+                    .payload = .{
+                        .client = self.client,
+                        .buffer = buffer,
+                    },
+                }, self);
+            },
+            .CQE => {
+                const res = loop.result_for(Read, self.returned_from) catch |err| {
+                    self.result = err;
+                    self.state = .Done;
+                    return;
+                };
+                const amt: usize = @intCast(res.result);
+                const attempted = self.iovecs[self.i].len;
+                self.iovecs[self.i].len = amt;
+                self.i += 1;
+                self.amt += amt;
+                if (amt < attempted) {
+                    self.result = self.amt;
+                    self.state = .Done;
+                    return;
+                }
+                self.state = .SQE;
+                continue :outer .SQE;
+            },
+            .Done => {},
+        }
+    }
+};
+
 pub const WritevAll = struct {
     pub const State = enum { Init, SQE, CQE, Done };
     pub const Result = SQEError!void;
@@ -607,11 +668,10 @@ pub const TlsReadvAdvanced = struct {
     callback: PendingIndex = PendingIndex.empty(),
 
     pub fn run(self: *@This(), loop: anytype) !void {
-        _ = loop;
         const c = self.tls_client;
         const iovecs = self.iovecs;
 
-        outer: switch (self.state) {
+        switch (self.state) {
             .Init => {
                 self.read_state.vp = .{ .iovecs = iovecs };
 
@@ -681,20 +741,19 @@ pub const TlsReadvAdvanced = struct {
                 const ask_len = @max(wanted_read_len, self.read_state.cleartext_stack_buffer.len) - c.partial_ciphertext_end;
                 const ask_iovecs = vendored_tls.limitVecs(&ask_iovecs_buf, ask_len);
 
-                // TODO: async
-                self.actual_read_len = std.os.linux.readv(self.client, ask_iovecs.ptr, ask_iovecs.len);
                 self.state = .CQE;
-                continue :outer .CQE;
+                try loop.schedule_with_callback(Readv{
+                    .client = self.client,
+                    .iovecs = ask_iovecs,
+                }, self);
             },
             .CQE => {
-                // const res = loop.result_for(Readv, self.returned_from) catch |err| {
-                //     self.result = err;
-                //     self.state = .Done;
-                //     return;
-                // };
-                // const actual_read_len: usize = @intCast(res.result);
+                const actual_read_len = loop.result_for(Readv, self.returned_from) catch |err| {
+                    self.result = err;
+                    self.state = .Done;
+                    return;
+                };
 
-                const actual_read_len: usize = self.actual_read_len;
                 if (actual_read_len == 0) {
                     // This is either a truncation attack, a bug in the server, or an
                     // intentional omission of the close_notify message due to truncation
@@ -1576,7 +1635,7 @@ pub fn main() !void {
         tls_read_state: TlsReadState,
     };
 
-    var loop = try Loop(&[_]type{ LoopTimeout, WriteStdout, CQEResultPendingEvent, PollCompletions, Connect, Write, Read, ExampleSSLRequest, TlsInit, TlsRead, TlsReadvAdvanced, TlsWrite, WritevAll, Writev, ReadAtLeastOurAmtDecoder, ReadAtLeastDecoder, ReadAtLeast }, Context).init(std.heap.smp_allocator, .{
+    var loop = try Loop(&[_]type{ LoopTimeout, WriteStdout, CQEResultPendingEvent, PollCompletions, Connect, Write, Read, Readv, ExampleSSLRequest, TlsInit, TlsRead, TlsReadvAdvanced, TlsWrite, WritevAll, Writev, ReadAtLeastOurAmtDecoder, ReadAtLeastDecoder, ReadAtLeast }, Context).init(std.heap.smp_allocator, .{
         .ring = &ring.ring,
         .recv = undefined,
         .tls_client = undefined,
