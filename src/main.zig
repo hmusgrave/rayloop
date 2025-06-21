@@ -19,15 +19,40 @@ const Foo = struct {
             .Writing1 => {
                 std.debug.print("Writing 1\n", .{});
                 self.state = .Writing2;
-                try loop.schedule_with_callback(Bar{}, self);
+                const pwc = try loop.pend_with_callback(Baz{}, self);
+                _ = pwc.pend_loc;
+                try pwc.store.store(self.*);
             },
             .Writing2 => {
-                std.debug.print("Writing 2 {}\n", .{loop.result_for(Bar, self.returned_from)});
+                std.debug.print("Writing 2 {}\n", .{loop.result_for(Baz, self.returned_from)});
                 self.state = .Done;
                 try loop.schedule(Bar{});
             },
             .Done => {},
         }
+    }
+};
+
+const Timeout = struct {
+    pub const State = enum { Waiting, Done };
+    pub const Result = void;
+
+    deadline_ns: i128,
+    state: State = .Waiting,
+    result: Result = {},
+    scheduled: bool = false,
+    returned_from: PendingIndex = PendingIndex.empty(),
+    callback: PendingIndex = PendingIndex.empty(),
+
+    pub fn init(elapsed_ns: i128) @This() {
+        return .{ .deadline_ns = std.time.nanoTimestamp() + elapsed_ns };
+    }
+
+    pub fn run(self: *@This(), loop: anytype) !void {
+        const now = std.time.nanoTimestamp();
+
+        if (now >= self.deadline_ns)
+            loop.stop();
     }
 };
 
@@ -54,7 +79,58 @@ const Bar = struct {
     }
 };
 
-fn Loop(events: []const type, Context: type) type {
+// Template for CQE queue depletion
+const UnpendBaz = struct {
+    pub const State = enum { Unpend, Done };
+    pub const Result = u32;
+
+    state: State = .Unpend,
+    result: Result = undefined,
+    scheduled: bool = false,
+    returned_from: PendingIndex = PendingIndex.empty(),
+    callback: PendingIndex = PendingIndex.empty(),
+
+    fn run(_: *@This(), loop: anytype) !void {
+        const pool: *ObjectPool(Baz) = loop.pending.getByType(Baz);
+        if (pool.count > 0) {
+            for (0..pool.data.items.len) |i| {
+                var found: bool = false;
+                for (pool.freelist.items) |x| {
+                    if (i == x)
+                        found = true;
+                }
+                if (found)
+                    continue;
+                try loop.unpend_follow_callback(.{ .tuple_index = @TypeOf(loop.pending).getIndex(Baz), .pool_index = @intCast(i) }, u32, 12345);
+            }
+        }
+    }
+};
+
+const Baz = struct {
+    pub const State = enum { BazPrint, Done };
+    pub const Result = u32;
+
+    state: State = .BazPrint,
+    result: Result = undefined,
+    scheduled: bool = false,
+    returned_from: PendingIndex = PendingIndex.empty(),
+    callback: PendingIndex = PendingIndex.empty(),
+
+    fn run(self: *@This(), loop: anytype) !void {
+        _ = loop;
+        switch (self.state) {
+            .BazPrint => {
+                self.state = .Done;
+                self.result = 42;
+                std.debug.print("Baz\n", .{});
+            },
+            .Done => {},
+        }
+    }
+};
+
+pub fn Loop(events: []const type, Context: type) type {
     for (events) |T| {
         if (@sizeOf(T) <= 0)
             @compileError("std bug prevents zero-sized event types: " ++ @typeName(T));
@@ -76,10 +152,21 @@ fn Loop(events: []const type, Context: type) type {
     const Pools = MappedTuple(events, ObjectPool);
 
     return struct {
+        // Work queues, one per Event
         submitted: Fifos,
+
+        // Resizable object pools, one per Event
         pending: Pools,
+
+        // User-configured global context
         context: Context,
+
+        // Cooperative scheduling. Unset this to ask the loop to die.
         running: bool,
+
+        // Zero iff the loop has run to completion. Invariant not always
+        // upheld _inside_ loop methods. Some work not explicitly tracked
+        // if not necessary for upholding that invariant.
         outstanding_work: usize,
 
         pub fn init(allocator: std.mem.Allocator, context: Context) !@This() {
@@ -111,25 +198,80 @@ fn Loop(events: []const type, Context: type) type {
             return self.pending.getByType(Event).get(index.pool_index).result;
         }
 
-        // pub fn acquire_and_set_pending(self: *@This(), T: type, data: anytype) !T {
-        //     const tuple_index = comptime @TypeOf(self.pending).getIndex(T);
-        //     var pool = self.pending.getByIndex(tuple_index);
-        //     const pool_index = try pool.acquire();
-        //     const item = default_initialize(T, .{
-        //         data,
-        //         .{
-        //             .loc = PendingIndex{
-        //                 .tuple_index = tuple_index,
-        //                 .pool_index = pool_index,
-        //             },
-        //             .result = @as(i32, undefined),
-        //             .flags = @as(u32, undefined),
-        //         },
-        //     });
-        //     pool.set(pool_index, item);
-        //     self.outstanding_work += 1;
-        //     return item;
-        // }
+        fn check_pointer_to_struct(T: type) void {
+            if (@typeInfo(T) != .pointer or @typeInfo(@typeInfo(T).pointer.child) != .@"struct")
+                @compileError(std.fmt.comptimePrint("Received ({s}) instead of pointer to callback event struct", .{@typeName(T)}));
+        }
+
+        const Self = @This();
+        pub fn Store(Event: type) type {
+            return struct {
+                loop: *Self,
+                loc: PendingIndex,
+
+                pub fn store(self: @This(), event: Event) !void {
+                    self.loop.pending.getByType(Event).set(self.loc.pool_index, event);
+                }
+            };
+        }
+
+        pub fn PendWithCallback(Event: type) type {
+            return struct {
+                pend_loc: PendingIndex,
+                store: Store(Event),
+            };
+        }
+
+        pub fn unpend_follow_callback(self: *@This(), loc: PendingIndex, Result: type, result: Result) !void {
+            inline for (events, 0..) |_, i| {
+                if (i == loc.tuple_index) {
+                    var pool = self.pending.getByIndex(i);
+                    var event = pool.get(loc.pool_index);
+                    if (@TypeOf(event).Result != Result)
+                        unreachable;
+                    event.result = result;
+                    pool.set(loc.pool_index, event);
+                    inline for (events, 0..) |_, j| {
+                        if (j == event.callback.tuple_index) {
+                            var callback_pool = self.pending.getByIndex(j);
+                            var callback_event = callback_pool.get(event.callback.pool_index);
+                            callback_pool.release(event.callback.pool_index);
+                            callback_event.returned_from = loc;
+                            self.outstanding_work -= 1;
+                            try self.schedule(callback_event);
+                        }
+                    }
+                }
+            }
+        }
+
+        pub fn pend_with_callback(self: *@This(), event: anytype, callback: anytype) !PendWithCallback(@TypeOf(callback.*)) {
+            comptime check_pointer_to_struct(@TypeOf(callback));
+
+            const event_tuple_index = comptime @TypeOf(self.pending).getIndex(@TypeOf(event));
+            const callback_tuple_index = comptime @TypeOf(self.pending).getIndex(@TypeOf(callback.*));
+
+            var event_pool = self.pending.getByIndex(event_tuple_index);
+            var callback_pool = self.pending.getByIndex(callback_tuple_index);
+
+            const event_pool_index = try event_pool.acquire();
+            const callback_pool_index = try callback_pool.acquire();
+
+            var event_copy = event;
+            event_copy.callback = .{ .tuple_index = callback_tuple_index, .pool_index = callback_pool_index };
+            event_pool.set(event_pool_index, event_copy);
+
+            callback.scheduled = true;
+            self.outstanding_work += 1;
+
+            return .{
+                .pend_loc = .{ .tuple_index = event_tuple_index, .pool_index = event_pool_index },
+                .store = .{
+                    .loop = self,
+                    .loc = event_copy.callback,
+                },
+            };
+        }
 
         pub fn schedule(self: *@This(), event: anytype) !void {
             try self.submitted.getByType(@TypeOf(event)).writeItem(event);
@@ -137,8 +279,7 @@ fn Loop(events: []const type, Context: type) type {
         }
 
         pub fn schedule_with_callback(self: *@This(), event: anytype, callback: anytype) !void {
-            if (@typeInfo(@TypeOf(callback)) != .pointer or @typeInfo(@typeInfo(@TypeOf(callback)).pointer.child) != .@"struct")
-                @compileError(std.fmt.comptimePrint("Received ({s}) instead of pointer to callback event struct", .{@typeName(@TypeOf(callback))}));
+            comptime check_pointer_to_struct(@TypeOf(callback));
 
             const tuple_index = comptime @TypeOf(self.pending).getIndex(@TypeOf(callback.*));
             var pool = self.pending.getByIndex(tuple_index);
@@ -148,8 +289,16 @@ fn Loop(events: []const type, Context: type) type {
             event_copy.callback = .{ .tuple_index = tuple_index, .pool_index = pool_index };
             callback.scheduled = true;
             pool.set(pool_index, callback.*);
-            self.outstanding_work += 1; // callback
             try self.schedule(event_copy);
+        }
+
+        fn print_state(self: *@This()) void {
+            std.debug.print("\nWORK: {}\n", .{self.outstanding_work});
+            inline for (events) |T| {
+                const pc = self.pending.getByType(T).count;
+                const wc = self.submitted.getByType(T).count;
+                std.debug.print("{s}: {} {}\n", .{ @typeName(T), pc, wc });
+            }
         }
 
         pub fn run(self: *@This()) !void {
@@ -202,7 +351,6 @@ fn Loop(events: []const type, Context: type) type {
                                         const pool_index = try event_pool.acquire();
                                         callback_event.returned_from = .{ .tuple_index = i, .pool_index = pool_index };
                                         event_pool.set(pool_index, event);
-                                        self.outstanding_work -= 1;
                                         try self.schedule(callback_event);
                                     }
                                 }
@@ -222,8 +370,11 @@ fn Loop(events: []const type, Context: type) type {
 }
 
 pub fn main() !void {
-    var loop = try Loop(&[_]type{ Foo, Bar }, void).init(std.heap.smp_allocator, {});
+    var loop = try Loop(&[_]type{ Foo, Bar, Baz, UnpendBaz, Timeout }, void).init(std.heap.smp_allocator, {});
     defer loop.deinit();
     try loop.schedule(Foo{});
+    try loop.schedule(UnpendBaz{});
+    try loop.schedule(Timeout.init(std.time.ns_per_ms));
     try loop.run();
+    loop.print_state();
 }
