@@ -1106,7 +1106,7 @@ pub fn writeEnd(c: *Client, stream: anytype, bytes: []const u8, end: bool) !usiz
     }
 }
 
-fn prepareCiphertextRecord(
+pub fn prepareCiphertextRecord(
     c: *Client,
     iovecs: []std.posix.iovec_const,
     ciphertext_buf: []u8,

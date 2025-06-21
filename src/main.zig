@@ -567,8 +567,96 @@ pub const TlsInit = struct {
     }
 };
 
+pub const TlsWriteState = struct {
+    iovecs_buf: [6]std.posix.iovec_const = undefined,
+    ciphertext_buf: [std.crypto.tls.max_ciphertext_record_len * 4]u8 = undefined,
+};
+
+/// Returns the number of cleartext bytes sent, which may be fewer than `bytes.len`.
+pub const TlsWrite = struct {
+    pub const State = enum { Init, SQE, CQE, Done };
+    pub const Result = SQEError!usize;
+
+    client: i32,
+    tls_client: *std.crypto.tls.Client,
+    write_state: *TlsWriteState,
+    data: []const u8,
+
+    iovec_end: usize = undefined,
+    overhead_len: usize = undefined,
+    i: usize = 0,
+    total_amt: usize = 0,
+
+    state: State = .Init,
+    result: Result = undefined,
+    scheduled: bool = false,
+    returned_from: PendingIndex = PendingIndex.empty(),
+    callback: PendingIndex = PendingIndex.empty(),
+
+    pub fn run(self: *@This(), loop: anytype) !void {
+        const c = self.tls_client;
+        const bytes = self.data;
+
+        outer: switch (self.state) {
+            .Init => {
+                self.write_state.* = .{};
+
+                const prepared = vendored_tls.prepareCiphertextRecord(c, &self.write_state.iovecs_buf, &self.write_state.ciphertext_buf, bytes, .application_data);
+
+                self.iovec_end = prepared.iovec_end;
+                self.overhead_len = prepared.overhead_len;
+                self.state = .SQE;
+                continue :outer .SQE;
+            },
+            .SQE => {
+                self.state = .CQE;
+                try loop.schedule_with_callback(Writev{
+                    .payload = .{
+                        .client = self.client,
+                        .iovecs = self.write_state.iovecs_buf[self.i..self.iovec_end],
+                    },
+                }, self);
+            },
+            .CQE => {
+                const res = loop.result_for(Writev, self.returned_from) catch |err| {
+                    self.result = err;
+                    self.state = .Done;
+                    return;
+                };
+                var amt: usize = @intCast(res.result);
+                while (amt >= self.write_state.iovecs_buf[self.i].len) {
+                    const encrypted_amt = self.write_state.iovecs_buf[self.i].len;
+                    self.total_amt += encrypted_amt - self.overhead_len;
+                    amt -= encrypted_amt;
+                    self.i += 1;
+                    // Rely on the property that iovecs delineate records, meaning that
+                    // if amt equals zero here, we have fortunately found ourselves
+                    // with a short read that aligns at the record boundary.
+                    if (self.i >= self.iovec_end) {
+                        self.result = self.total_amt;
+                        self.state = .Done;
+                        return;
+                    }
+                    // We also cannot return on a vector boundary if the final close_notify is
+                    // not sent; otherwise the caller would not know to retry the call.
+                    if (amt == 0) {
+                        self.result = self.total_amt;
+                        self.state = .Done;
+                        return;
+                    }
+                }
+                self.write_state.iovecs_buf[self.i].base += amt;
+                self.write_state.iovecs_buf[self.i].len -= amt;
+                self.state = .SQE;
+                continue :outer .SQE;
+            },
+            .Done => {},
+        }
+    }
+};
+
 pub const ExampleSSLRequest = struct {
-    pub const State = enum { Connect, Write, PostWrite, Done };
+    pub const State = enum { Connect, TlsInit, Write, Read, Done };
     pub const Result = SQEError!void;
 
     client: i32,
@@ -586,7 +674,7 @@ pub const ExampleSSLRequest = struct {
         switch (self.state) {
             .Connect => {
                 self.tls_client = &loop.context.tls_client;
-                self.state = .Write;
+                self.state = .TlsInit;
                 try loop.schedule_with_callback(Connect{
                     .payload = .{
                         .client = self.client,
@@ -594,7 +682,7 @@ pub const ExampleSSLRequest = struct {
                     },
                 }, self);
             },
-            .Write => {
+            .TlsInit => {
                 _ = loop.result_for(Connect, self.returned_from) catch |err| {
                     std.debug.print("Connect Err: {}\n", .{err});
                     self.state = .Done;
@@ -603,7 +691,7 @@ pub const ExampleSSLRequest = struct {
                 std.debug.print("Connect Success\n", .{});
                 try loop.schedule(WriteStdout{ .payload = "Connect Success (io_uring)\n" });
 
-                self.state = .PostWrite;
+                self.state = .Write;
                 try loop.schedule_with_callback(TlsInit{
                     .client = self.client,
                     .host = "example.com",
@@ -614,7 +702,7 @@ pub const ExampleSSLRequest = struct {
                     },
                 }, self);
             },
-            .PostWrite => {
+            .Write => {
                 self.tls_client.* = loop.result_for(TlsInit, self.returned_from) catch |err| {
                     std.debug.print("TlsInit Err: {!}\n", .{err});
                     self.state = .Done;
@@ -623,8 +711,16 @@ pub const ExampleSSLRequest = struct {
                 std.debug.print("TLS Initialized\n", .{});
 
                 const buffer_send = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
-                const write_stream = WriteStream{ .client = self.client };
-                _ = self.tls_client.write(write_stream, buffer_send) catch |err| {
+                self.state = .Read;
+                try loop.schedule_with_callback(TlsWrite{
+                    .client = self.client,
+                    .tls_client = &loop.context.tls_client,
+                    .data = buffer_send,
+                    .write_state = &loop.context.tls_write_state,
+                }, self);
+            },
+            .Read => {
+                _ = loop.result_for(TlsWrite, self.returned_from) catch |err| {
                     std.debug.print("Write Err: {!}\n", .{err});
                     self.state = .Done;
                     return;
@@ -923,13 +1019,15 @@ pub fn main() !void {
         recv: [1024 * 64]u8,
         tls_client: std.crypto.tls.Client,
         tls_init: vendored_tls.TlsInit,
+        tls_write_state: TlsWriteState,
     };
 
-    var loop = try Loop(&[_]type{ LoopTimeout, WriteStdout, CQEResultPendingEvent, PollCompletions, Connect, Write, Read, ExampleSSLRequest, TlsInit, WritevAll, Writev, ReadAtLeastOurAmtDecoder, ReadAtLeastDecoder, ReadAtLeast }, Context).init(std.heap.smp_allocator, .{
+    var loop = try Loop(&[_]type{ LoopTimeout, WriteStdout, CQEResultPendingEvent, PollCompletions, Connect, Write, Read, ExampleSSLRequest, TlsInit, TlsWrite, WritevAll, Writev, ReadAtLeastOurAmtDecoder, ReadAtLeastDecoder, ReadAtLeast }, Context).init(std.heap.smp_allocator, .{
         .ring = &ring.ring,
         .recv = undefined,
         .tls_client = undefined,
         .tls_init = undefined,
+        .tls_write_state = undefined,
     });
     defer loop.deinit();
 
