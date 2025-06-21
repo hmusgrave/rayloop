@@ -235,7 +235,7 @@ pub const TlsInit = struct {
         finished,
     };
 
-    pub const State = enum { CleartextHeader, PreFragment, Fragment, FragmentReadTheirs, HandshakePreLoopStart, HandshakeLoopStart, HandshakeLoopEnd, Done };
+    pub const State = enum { CleartextHeader, PreFragment, Fragment, FragmentReadTheirs, HandshakePreLoopStart, HandshakeLoopStart, HandshakeLoopEnd, HandshakeSwitchEnd, HandshakeHelloServerDonePreWrite, HandshakeHelloServerDonePostWrite, Done };
     state: State = .CleartextHeader,
 
     options: Options = undefined,
@@ -276,6 +276,7 @@ pub const TlsInit = struct {
     record_len: u16 = undefined,
     ctd: tls.Decoder = undefined,
     ct: tls.ContentType = undefined,
+    wrapped_handshake: []const u8 = undefined,
 
     pub fn run(self: *@This(), stream: anytype, E: type, arg: RunArg(E)) InitError(@TypeOf(stream))!Result {
         outer: switch (self.state) {
@@ -512,7 +513,7 @@ pub const TlsInit = struct {
                     self.state = .Fragment;
                     continue :outer .Fragment;
                 };
-                const wrapped_handshake = self.ctd.buf[self.ctd.idx - handshake_len - 4 .. self.ctd.idx];
+                self.wrapped_handshake = self.ctd.buf[self.ctd.idx - handshake_len - 4 .. self.ctd.idx];
                 switch (handshake_type) {
                     .server_hello => {
                         if (self.cipher_state != .cleartext) return error.TlsUnexpectedMessage;
@@ -585,7 +586,7 @@ pub const TlsInit = struct {
                                 const p = &@field(self.handshake_cipher, @tagName(tag.with()));
                                 p.transcript_hash.update(self.cleartext_header[tls.record_header_len..]); // Client Hello part 1
                                 p.transcript_hash.update(self.host); // Client Hello part 2
-                                p.transcript_hash.update(wrapped_handshake);
+                                p.transcript_hash.update(self.wrapped_handshake);
                             },
 
                             else => return error.TlsIllegalParameter,
@@ -647,7 +648,7 @@ pub const TlsInit = struct {
                         if (self.cipher_state != .handshake) return error.TlsUnexpectedMessage;
                         if (self.handshake_state != .encrypted_extensions) return error.TlsUnexpectedMessage;
                         switch (self.handshake_cipher) {
-                            inline else => |*p| p.transcript_hash.update(wrapped_handshake),
+                            inline else => |*p| p.transcript_hash.update(self.wrapped_handshake),
                         }
                         try hsd.ensure(2);
                         const total_ext_size = hsd.decode(u16);
@@ -673,7 +674,7 @@ pub const TlsInit = struct {
                             else => return error.TlsUnexpectedMessage,
                         }
                         switch (self.handshake_cipher) {
-                            inline else => |*p| p.transcript_hash.update(wrapped_handshake),
+                            inline else => |*p| p.transcript_hash.update(self.wrapped_handshake),
                         }
 
                         switch (self.tls_version) {
@@ -752,7 +753,7 @@ pub const TlsInit = struct {
                         }
 
                         switch (self.handshake_cipher) {
-                            inline else => |*p| p.transcript_hash.update(wrapped_handshake),
+                            inline else => |*p| p.transcript_hash.update(self.wrapped_handshake),
                         }
                         try hsd.ensure(1 + 2 + 1);
                         const curve_type = hsd.decode(u8);
@@ -766,86 +767,8 @@ pub const TlsInit = struct {
                         self.handshake_state = .server_hello_done;
                     },
                     .server_hello_done => {
-                        if (self.tls_version != .tls_1_2) return error.TlsUnexpectedMessage;
-                        if (self.cipher_state != .cleartext) return error.TlsUnexpectedMessage;
-                        if (self.handshake_state != .server_hello_done) return error.TlsUnexpectedMessage;
-
-                        const client_key_exchange_msg = .{@intFromEnum(tls.ContentType.handshake)} ++
-                            int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
-                            array(u16, u8, .{@intFromEnum(tls.HandshakeType.client_key_exchange)} ++
-                                array(u24, u8, array(u8, u8, self.key_share.secp256r1_kp.public_key.toUncompressedSec1())));
-                        const client_change_cipher_spec_msg = .{@intFromEnum(tls.ContentType.change_cipher_spec)} ++
-                            int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
-                            array(u16, tls.ChangeCipherSpecType, .{.change_cipher_spec});
-                        const pre_master_secret = self.key_share.getSharedSecret().?;
-                        switch (self.handshake_cipher) {
-                            inline else => |*p| {
-                                const P = @TypeOf(p.*).A;
-                                p.transcript_hash.update(wrapped_handshake);
-                                p.transcript_hash.update(client_key_exchange_msg[tls.record_header_len..]);
-                                const master_secret = hmacExpandLabel(P.Hmac, pre_master_secret, &.{
-                                    "master secret",
-                                    &self.client_hello_rand,
-                                    &self.server_hello_rand,
-                                }, 48);
-                                if (self.options.ssl_key_log_file) |key_log_file| logSecrets(key_log_file, .{
-                                    .client_random = &self.client_hello_rand,
-                                }, .{
-                                    .CLIENT_RANDOM = &master_secret,
-                                });
-                                const key_block = hmacExpandLabel(
-                                    P.Hmac,
-                                    &master_secret,
-                                    &.{ "key expansion", &self.server_hello_rand, &self.client_hello_rand },
-                                    @sizeOf(P.Tls_1_2),
-                                );
-                                const client_verify_cleartext = .{@intFromEnum(tls.HandshakeType.finished)} ++
-                                    array(u24, u8, hmacExpandLabel(
-                                        P.Hmac,
-                                        &master_secret,
-                                        &.{ "client finished", &p.transcript_hash.peek() },
-                                        P.verify_data_length,
-                                    ));
-                                p.transcript_hash.update(&client_verify_cleartext);
-                                p.version = .{ .tls_1_2 = .{
-                                    .expected_server_verify_data = hmacExpandLabel(
-                                        P.Hmac,
-                                        &master_secret,
-                                        &.{ "server finished", &p.transcript_hash.finalResult() },
-                                        P.verify_data_length,
-                                    ),
-                                    .app_cipher = std.mem.bytesToValue(P.Tls_1_2, &key_block),
-                                } };
-                                const pv = &p.version.tls_1_2;
-                                const nonce: [P.AEAD.nonce_length]u8 = nonce: {
-                                    const V = @Vector(P.AEAD.nonce_length, u8);
-                                    const pad = [1]u8{0} ** (P.AEAD.nonce_length - 8);
-                                    const operand: V = pad ++ @as([8]u8, @bitCast(big(self.write_seq)));
-                                    break :nonce @as(V, pv.app_cipher.client_write_IV ++ pv.app_cipher.client_salt) ^ operand;
-                                };
-                                var client_verify_msg = .{@intFromEnum(tls.ContentType.handshake)} ++
-                                    int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
-                                    array(u16, u8, nonce[P.fixed_iv_length..].* ++
-                                        @as([client_verify_cleartext.len + P.mac_length]u8, undefined));
-                                P.AEAD.encrypt(
-                                    client_verify_msg[client_verify_msg.len - P.mac_length -
-                                        client_verify_cleartext.len ..][0..client_verify_cleartext.len],
-                                    client_verify_msg[client_verify_msg.len - P.mac_length ..][0..P.mac_length],
-                                    &client_verify_cleartext,
-                                    std.mem.toBytes(big(self.write_seq)) ++ client_verify_msg[0 .. 1 + 2] ++ int(u16, client_verify_cleartext.len),
-                                    nonce,
-                                    pv.app_cipher.client_write_key,
-                                );
-                                const all_msgs = client_key_exchange_msg ++ client_change_cipher_spec_msg ++ client_verify_msg;
-                                var all_msgs_vec = [_]std.posix.iovec_const{
-                                    .{ .base = &all_msgs, .len = all_msgs.len },
-                                };
-                                try stream.writevAll(&all_msgs_vec);
-                            },
-                        }
-                        self.write_seq += 1;
-                        self.pending_cipher_state = .application;
-                        self.handshake_state = .finished;
+                        self.state = .HandshakeHelloServerDonePreWrite;
+                        continue :outer .HandshakeHelloServerDonePreWrite;
                     },
                     .certificate_verify => {
                         if (self.tls_version != .tls_1_3) return error.TlsUnexpectedMessage;
@@ -861,7 +784,7 @@ pub const TlsInit = struct {
                                     " " ** 64 ++ "TLS 1.3, server CertificateVerify\x00",
                                     &p.transcript_hash.peek(),
                                 });
-                                p.transcript_hash.update(wrapped_handshake);
+                                p.transcript_hash.update(self.wrapped_handshake);
                             },
                         }
                         self.handshake_state = .finished;
@@ -880,7 +803,7 @@ pub const TlsInit = struct {
                                     const P = @TypeOf(p.*).A;
                                     try hsd.ensure(P.Hmac.mac_length);
                                     const finished_digest = p.transcript_hash.peek();
-                                    p.transcript_hash.update(wrapped_handshake);
+                                    p.transcript_hash.update(self.wrapped_handshake);
                                     const expected_server_verify_data = tls.hmac(P.Hmac, &finished_digest, pv.server_finished_key);
                                     if (!std.crypto.timing_safe.eql([P.Hmac.mac_length]u8, expected_server_verify_data, hsd.array(P.Hmac.mac_length).*)) return error.TlsDecryptError;
                                     const handshake_hash = p.transcript_hash.finalResult();
@@ -968,6 +891,98 @@ pub const TlsInit = struct {
                     },
                     else => return error.TlsUnexpectedMessage,
                 }
+                self.state = .HandshakeSwitchEnd;
+                continue :outer .HandshakeSwitchEnd;
+            },
+            .HandshakeHelloServerDonePreWrite => {
+                if (self.tls_version != .tls_1_2) return error.TlsUnexpectedMessage;
+                if (self.cipher_state != .cleartext) return error.TlsUnexpectedMessage;
+                if (self.handshake_state != .server_hello_done) return error.TlsUnexpectedMessage;
+
+                const client_key_exchange_msg = .{@intFromEnum(tls.ContentType.handshake)} ++
+                    int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
+                    array(u16, u8, .{@intFromEnum(tls.HandshakeType.client_key_exchange)} ++
+                        array(u24, u8, array(u8, u8, self.key_share.secp256r1_kp.public_key.toUncompressedSec1())));
+                const client_change_cipher_spec_msg = .{@intFromEnum(tls.ContentType.change_cipher_spec)} ++
+                    int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
+                    array(u16, tls.ChangeCipherSpecType, .{.change_cipher_spec});
+                const pre_master_secret = self.key_share.getSharedSecret().?;
+                switch (self.handshake_cipher) {
+                    inline else => |*p| {
+                        const P = @TypeOf(p.*).A;
+                        p.transcript_hash.update(self.wrapped_handshake);
+                        p.transcript_hash.update(client_key_exchange_msg[tls.record_header_len..]);
+                        const master_secret = hmacExpandLabel(P.Hmac, pre_master_secret, &.{
+                            "master secret",
+                            &self.client_hello_rand,
+                            &self.server_hello_rand,
+                        }, 48);
+                        if (self.options.ssl_key_log_file) |key_log_file| logSecrets(key_log_file, .{
+                            .client_random = &self.client_hello_rand,
+                        }, .{
+                            .CLIENT_RANDOM = &master_secret,
+                        });
+                        const key_block = hmacExpandLabel(
+                            P.Hmac,
+                            &master_secret,
+                            &.{ "key expansion", &self.server_hello_rand, &self.client_hello_rand },
+                            @sizeOf(P.Tls_1_2),
+                        );
+                        const client_verify_cleartext = .{@intFromEnum(tls.HandshakeType.finished)} ++
+                            array(u24, u8, hmacExpandLabel(
+                                P.Hmac,
+                                &master_secret,
+                                &.{ "client finished", &p.transcript_hash.peek() },
+                                P.verify_data_length,
+                            ));
+                        p.transcript_hash.update(&client_verify_cleartext);
+                        p.version = .{ .tls_1_2 = .{
+                            .expected_server_verify_data = hmacExpandLabel(
+                                P.Hmac,
+                                &master_secret,
+                                &.{ "server finished", &p.transcript_hash.finalResult() },
+                                P.verify_data_length,
+                            ),
+                            .app_cipher = std.mem.bytesToValue(P.Tls_1_2, &key_block),
+                        } };
+                        const pv = &p.version.tls_1_2;
+                        const nonce: [P.AEAD.nonce_length]u8 = nonce: {
+                            const V = @Vector(P.AEAD.nonce_length, u8);
+                            const pad = [1]u8{0} ** (P.AEAD.nonce_length - 8);
+                            const operand: V = pad ++ @as([8]u8, @bitCast(big(self.write_seq)));
+                            break :nonce @as(V, pv.app_cipher.client_write_IV ++ pv.app_cipher.client_salt) ^ operand;
+                        };
+                        var client_verify_msg = .{@intFromEnum(tls.ContentType.handshake)} ++
+                            int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2)) ++
+                            array(u16, u8, nonce[P.fixed_iv_length..].* ++
+                                @as([client_verify_cleartext.len + P.mac_length]u8, undefined));
+                        P.AEAD.encrypt(
+                            client_verify_msg[client_verify_msg.len - P.mac_length -
+                                client_verify_cleartext.len ..][0..client_verify_cleartext.len],
+                            client_verify_msg[client_verify_msg.len - P.mac_length ..][0..P.mac_length],
+                            &client_verify_cleartext,
+                            std.mem.toBytes(big(self.write_seq)) ++ client_verify_msg[0 .. 1 + 2] ++ int(u16, client_verify_cleartext.len),
+                            nonce,
+                            pv.app_cipher.client_write_key,
+                        );
+                        const all_msgs = client_key_exchange_msg ++ client_change_cipher_spec_msg ++ client_verify_msg;
+                        var all_msgs_vec = [_]std.posix.iovec_const{
+                            .{ .base = &all_msgs, .len = all_msgs.len },
+                        };
+                        self.state = .HandshakeHelloServerDonePostWrite;
+                        return .{ .action = .{ .writevAll = &all_msgs_vec } };
+                    },
+                }
+            },
+            .HandshakeHelloServerDonePostWrite => {
+                try arg.stream.writevAll;
+                self.write_seq += 1;
+                self.pending_cipher_state = .application;
+                self.handshake_state = .finished;
+                self.state = .HandshakeSwitchEnd;
+                continue :outer .HandshakeSwitchEnd;
+            },
+            .HandshakeSwitchEnd => {
                 if (self.ctd.eof()) {
                     self.state = .HandshakeLoopEnd;
                     continue :outer .HandshakeLoopEnd;
