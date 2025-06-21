@@ -3,35 +3,7 @@ const ObjectPool = @import("object_pool.zig").ObjectPool;
 const MappedTuple = @import("mapped_tuple.zig").MappedTuple;
 const PendingIndex = @import("loop.zig").PendingIndex;
 const default_initialize = @import("mem.zig").default_initialize;
-
-const Foo = struct {
-    pub const State = enum { Writing1, Writing2, Done };
-    pub const Result = void;
-
-    state: State = .Writing1,
-    result: Result = {},
-    scheduled: bool = false,
-    returned_from: PendingIndex = PendingIndex.empty(),
-    callback: PendingIndex = PendingIndex.empty(),
-
-    fn run(self: *@This(), loop: anytype) !void {
-        switch (self.state) {
-            .Writing1 => {
-                std.debug.print("Writing 1\n", .{});
-                self.state = .Writing2;
-                const pwc = try loop.pend_with_callback(Baz{}, self);
-                _ = pwc.pend_loc;
-                try pwc.store.store(self.*);
-            },
-            .Writing2 => {
-                std.debug.print("Writing 2 {}\n", .{loop.result_for(Baz, self.returned_from)});
-                self.state = .Done;
-                try loop.schedule(Bar{});
-            },
-            .Done => {},
-        }
-    }
-};
+const Ring = @import("io_uring.zig").Ring;
 
 const Timeout = struct {
     pub const State = enum { Waiting, Done };
@@ -56,77 +28,80 @@ const Timeout = struct {
     }
 };
 
-const Bar = struct {
-    pub const State = enum { BarPrint, Done };
-    pub const Result = u32;
+pub const CQEResult = struct {
+    result: i32,
+    flags: u32,
 
-    state: State = .BarPrint,
+    pub fn err(self: @This()) std.os.linux.E {
+        const cqe = std.os.linux.io_uring_cqe{ .user_data = undefined, .res = self.result, .flags = self.flags };
+        return cqe.err();
+    }
+};
+
+pub const WriteStdout = struct {
+    pub const State = enum { Writing, Done };
+    pub const Result = CQEResult;
+
+    data: []const u8,
+
+    state: State = .Writing,
     result: Result = undefined,
     scheduled: bool = false,
     returned_from: PendingIndex = PendingIndex.empty(),
     callback: PendingIndex = PendingIndex.empty(),
 
-    fn run(self: *@This(), loop: anytype) !void {
-        _ = loop;
+    pub fn run(self: *@This(), loop: anytype) !void {
         switch (self.state) {
-            .BarPrint => {
+            .Writing => {
+                const pwc = try loop.pend_with_callback(CQEResultPendingEvent{}, self);
+                _ = try loop.context.ring.write(pwc.pend_loc.to_u64(), std.os.linux.STDOUT_FILENO, self.data, 0);
                 self.state = .Done;
-                self.result = 42;
-                std.debug.print("Bar\n", .{});
+                try pwc.store.store(self.*);
             },
-            .Done => {},
+            .Done => {
+                self.result = loop.result_for(CQEResultPendingEvent, self.returned_from);
+            },
         }
     }
 };
 
-// Template for CQE queue depletion
-const UnpendBaz = struct {
+pub const CQEResultPendingEvent = struct {
+    pub const State = enum { Done };
+    pub const Result = CQEResult;
+
+    state: State = .Done,
+    result: Result = undefined,
+    scheduled: bool = false,
+    returned_from: PendingIndex = PendingIndex.empty(),
+    callback: PendingIndex = PendingIndex.empty(),
+
+    pub fn run(_: *@This(), _: anytype) !void {}
+};
+
+// Schedules any CQE callbacks and submits any pending SQEs
+pub const PollCompletions = struct {
     pub const State = enum { Unpend, Done };
-    pub const Result = u32;
+    pub const Result = void;
 
     state: State = .Unpend,
-    result: Result = undefined,
+    result: Result = {},
     scheduled: bool = false,
     returned_from: PendingIndex = PendingIndex.empty(),
     callback: PendingIndex = PendingIndex.empty(),
 
-    fn run(_: *@This(), loop: anytype) !void {
-        const pool: *ObjectPool(Baz) = loop.pending.getByType(Baz);
-        if (pool.count > 0) {
-            for (0..pool.data.items.len) |i| {
-                var found: bool = false;
-                for (pool.freelist.items) |x| {
-                    if (i == x)
-                        found = true;
-                }
-                if (found)
-                    continue;
-                try loop.unpend_follow_callback(.{ .tuple_index = @TypeOf(loop.pending).getIndex(Baz), .pool_index = @intCast(i) }, u32, 12345);
+    pub fn run(_: *@This(), loop: anytype) !void {
+        var _cqes: [32]std.os.linux.io_uring_cqe = undefined;
+        const ready = loop.context.ring.cq_ready();
+        var completed: usize = 0;
+        while (completed < ready) {
+            const cqes = _cqes[0..@intCast(try loop.context.ring.copy_cqes(&_cqes, 0))];
+            defer completed += cqes.len;
+
+            for (cqes) |*cqe| {
+                try loop.unpend_follow_callback(PendingIndex.from_u64(cqe.user_data), CQEResult, .{ .result = cqe.res, .flags = cqe.flags });
             }
         }
-    }
-};
-
-const Baz = struct {
-    pub const State = enum { BazPrint, Done };
-    pub const Result = u32;
-
-    state: State = .BazPrint,
-    result: Result = undefined,
-    scheduled: bool = false,
-    returned_from: PendingIndex = PendingIndex.empty(),
-    callback: PendingIndex = PendingIndex.empty(),
-
-    fn run(self: *@This(), loop: anytype) !void {
-        _ = loop;
-        switch (self.state) {
-            .BazPrint => {
-                self.state = .Done;
-                self.result = 42;
-                std.debug.print("Baz\n", .{});
-            },
-            .Done => {},
-        }
+        _ = try loop.context.ring.submit();
     }
 };
 
@@ -370,11 +345,33 @@ pub fn Loop(events: []const type, Context: type) type {
 }
 
 pub fn main() !void {
-    var loop = try Loop(&[_]type{ Foo, Bar, Baz, UnpendBaz, Timeout }, void).init(std.heap.smp_allocator, {});
+    const allocator = std.heap.smp_allocator;
+
+    var ring: Ring = undefined;
+    try ring.setup(32);
+    defer ring.deinit();
+
+    var address_list = try std.net.getAddressList(allocator, "example.com", 80);
+    defer address_list.deinit();
+
+    if (address_list.addrs.len < 1)
+        return error.DnsLookupFailure;
+
+    const address = address_list.addrs[0];
+    const client = std.os.linux.socket(address.any.family, std.os.linux.SOCK.STREAM | std.os.linux.SOCK.CLOEXEC, 0);
+    defer _ = std.os.linux.close(@intCast(client));
+
+    const Context = struct {
+        ring: *std.os.linux.IoUring,
+    };
+
+    var loop = try Loop(&[_]type{ Timeout, WriteStdout, CQEResultPendingEvent, PollCompletions }, Context).init(std.heap.smp_allocator, .{
+        .ring = &ring.ring,
+    });
     defer loop.deinit();
-    try loop.schedule(Foo{});
-    try loop.schedule(UnpendBaz{});
+
     try loop.schedule(Timeout.init(std.time.ns_per_ms));
+    try loop.schedule(WriteStdout{ .data = "Hello, io_uring World!\n" });
+    try loop.schedule(PollCompletions{});
     try loop.run();
-    loop.print_state();
 }
