@@ -220,17 +220,34 @@ pub const ExampleSSLRequest = struct {
                 }
 
                 const stream = std.net.Stream{ .handle = self.client };
-                var foo = vendored_tls.TlsInit.init(.{
+                var foo = vendored_tls.TlsInit{};
+                const E = std.net.Stream.WriteError || error{ IsDir, ConnectionTimedOut, NotOpenForReading, SocketNotConnected, Canceled, TlsRecordOverflow, TlsConnectionTruncated };
+                var state: vendored_tls.TlsInit.RunArg(E) = .{ .options = .{
                     .host = .{ .explicit = "example.com" },
                     .ca = .{ .bundle = self.bundle.* },
-                });
+                } };
                 while (true) {
-                    switch (try foo.run(stream)) {
-                        .Done => |client| {
+                    switch (try foo.run(stream, E, state)) {
+                        .done => |client| {
                             self.tls_client.* = client;
                             break;
                         },
-                        .Pending => {},
+                        .action => |act| switch (act) {
+                            .writevAll => |iovecs| {
+                                const net_stream = std.net.Stream{ .handle = self.client };
+                                state = .{ .stream = .{ .writevAll = net_stream.writevAll(iovecs) } };
+                            },
+                            .decoder => |dec| switch (dec) {
+                                .readAtLeast => |x| {
+                                    const net_stream = std.net.Stream{ .handle = self.client };
+                                    state = .{ .stream = .{ .decoder = .{ .readAtLeast = x.decoder.readAtLeast(net_stream, x.their_amt) } } };
+                                },
+                                .readAtLeastOurAmt => |x| {
+                                    const net_stream = std.net.Stream{ .handle = self.client };
+                                    state = .{ .stream = .{ .decoder = .{ .readAtLeastOurAmt = x.decoder.readAtLeastOurAmt(net_stream, x.our_amt) } } };
+                                },
+                            },
+                        },
                     }
                 }
                 std.debug.print("TLS Initialized\n", .{});
