@@ -106,31 +106,7 @@ pub const StreamInterface = struct {
     }
 };
 
-pub const Options = struct {
-    /// How to perform host verification of server certificates.
-    host: union(enum) {
-        /// No host verification is performed, which prevents a trusted connection from
-        /// being established.
-        no_verification,
-        /// Verify that the server certificate was issued for a given host.
-        explicit: []const u8,
-    },
-    /// How to verify the authenticity of server certificates.
-    ca: union(enum) {
-        /// No ca verification is performed, which prevents a trusted connection from
-        /// being established.
-        no_verification,
-        /// Verify that the server certificate is a valid self-signed certificate.
-        /// This provides no authorization guarantees, as anyone can create a
-        /// self-signed certificate.
-        self_signed,
-        /// Verify that the server certificate is authorized by a given ca bundle.
-        bundle: Certificate.Bundle,
-    },
-    /// If non-null, ssl secrets are logged to this file.  Creating such a log file allows
-    /// other programs with access to that file to decrypt all traffic over this connection.
-    ssl_key_log_file: ?std.fs.File = null,
-};
+pub const Options = tls.Client.Options;
 
 pub fn InitError(E: type) type {
     return std.mem.Allocator.Error || E || tls.AlertDescription.Error || error{
