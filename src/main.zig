@@ -219,7 +219,6 @@ pub const ExampleSSLRequest = struct {
                     else => |err| std.debug.print("Connect Err: {}\n", .{err}),
                 }
 
-                const stream = std.net.Stream{ .handle = self.client };
                 var foo = vendored_tls.TlsInit{};
                 const E = std.net.Stream.WriteError || error{ IsDir, ConnectionTimedOut, NotOpenForReading, SocketNotConnected, Canceled, TlsRecordOverflow, TlsConnectionTruncated };
                 var state: vendored_tls.TlsInit.RunArg(E) = .{ .options = .{
@@ -227,7 +226,7 @@ pub const ExampleSSLRequest = struct {
                     .ca = .{ .bundle = self.bundle.* },
                 } };
                 while (true) {
-                    switch (try foo.run(stream, E, state)) {
+                    switch (try foo.run(E, state)) {
                         .done => |client| {
                             self.tls_client.* = client;
                             break;
