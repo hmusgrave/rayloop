@@ -199,10 +199,20 @@ pub const ExampleSSLRequest = struct {
                 }
 
                 const stream = std.net.Stream{ .handle = self.client };
-                self.tls_client = try vendored_tls.init(stream, .{
+                var foo = vendored_tls.TlsInit.init(.{
                     .host = .{ .explicit = "example.com" },
                     .ca = .{ .bundle = self.bundle.* },
                 });
+                while (true) {
+                    switch (try foo.run(stream)) {
+                        .Done => |client| {
+                            self.tls_client = client;
+                            break;
+                        },
+                        .Pending => {},
+                    }
+                }
+
                 const buffer_send = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
                 self.state = .Read;
                 try loop.schedule_with_callback(SocketWrite{

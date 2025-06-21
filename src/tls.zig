@@ -180,11 +180,30 @@ pub fn InitError(comptime Stream: type) type {
     };
 }
 
+pub const TlsInit = struct {
+    const State = enum { Init, Done };
+    state: State = .Init,
+
+    options: Options,
+
+    pub fn init(options: Options) @This() {
+        return .{ .options = options };
+    }
+    pub const MaybeClient = union(enum) {
+        Pending: void,
+        Done: Client,
+    };
+
+    pub fn run(self: *@This(), stream: anytype) InitError(@TypeOf(stream))!MaybeClient {
+        return .{ .Done = try orig_init(stream, self.options) };
+    }
+};
+
 /// Initiates a TLS handshake and establishes a TLSv1.2 or TLSv1.3 session with `stream`, which
 /// must conform to `StreamInterface`.
 ///
 /// `host` is only borrowed during this function call.
-pub fn init(stream: anytype, options: Options) InitError(@TypeOf(stream))!Client {
+pub fn orig_init(stream: anytype, options: Options) InitError(@TypeOf(stream))!Client {
     const host = switch (options.host) {
         .no_verification => "",
         .explicit => |host| host,
